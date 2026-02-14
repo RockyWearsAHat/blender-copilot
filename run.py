@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BlenderModelTraining — unified CLI.
+"""blender-copilot — unified CLI.
 
 One command to rule them all. Instead of remembering 6 different module
 paths and a dozen flags, just run:
@@ -108,7 +108,7 @@ def detect_device() -> str:
 def cmd_status(args):
     """Show current progress of data collection and training."""
     print(f"\n{C.BOLD}{'═' * 60}{C.END}")
-    print(f"{C.BOLD}  BlenderModelTraining — Status{C.END}")
+    print(f"{C.BOLD}  blender-copilot — Status{C.END}")
     print(f"{C.BOLD}{'═' * 60}{C.END}\n")
 
     # Device
@@ -571,7 +571,7 @@ def cmd_serve(args):
 def cmd_pipeline(args):
     """Run the full pipeline: scrape → extract → build → train."""
     print(f"\n{C.BOLD}{'═' * 60}{C.END}")
-    print(f"{C.BOLD}  BlenderModelTraining — Full Pipeline{C.END}")
+    print(f"{C.BOLD}  blender-copilot — Full Pipeline{C.END}")
     print(f"{C.BOLD}{'═' * 60}{C.END}\n")
 
     # Step 1: Scrape
@@ -608,7 +608,7 @@ def cmd_pipeline(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="BlenderModelTraining — train 3D models from Blender data",
+        description="blender-copilot — train 3D models from Blender data",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

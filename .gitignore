@@ -1,20 +1,15 @@
-# BlenderModelTraining
+# blender-copilot
 
-# Data directories
+# Data directories (large, generated)
 data/
-data/raw/
-data/extracted/
-data/filtered/
-data/labeled/
-data/datasets/
 
-# Model checkpoints
+# Model checkpoints (large binaries)
 checkpoints/
 *.pt
 *.pth
 *.ckpt
 
-# Blender files (downloaded)
+# Blender files (downloaded training data)
 *.blend
 *.blend1
 
@@ -48,8 +43,14 @@ Thumbs.db
 wandb/
 runs/
 
-# Misc
+# Build artifacts
 *.zip
 *.tar.gz
-progress_*.json
 nohup.out
+
+# Addon secrets (never commit)
+addon/apikey.txt
+
+# Misc
+progress_*.json
+test_outputs/

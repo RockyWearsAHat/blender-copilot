@@ -1,4 +1,4 @@
-# BlenderModelTraining
+# blender-copilot
 
 Fine-tuned local models for Blender 3D generation — trained on real community
 .blend files, not general-purpose LLMs.
@@ -111,7 +111,7 @@ involved, just direct data population via `bpy.data`.
 ## Project Structure
 
 ```
-BlenderModelTraining/
+blender-copilot/
 ├── README.md
 ├── requirements.txt
 ├── config.yaml                  # Global settings
@@ -174,7 +174,7 @@ BlenderModelTraining/
 
 ```bash
 # 1. Setup
-cd BlenderModelTraining
+cd blender-copilot
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 

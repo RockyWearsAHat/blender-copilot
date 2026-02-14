@@ -1,4 +1,4 @@
-"""Local model client for the AIHouseGenerator Blender addon.
+"""Local model client for the Blender Copilot addon.
 
 This module replaces the OpenAI API calls in ai_engine.py with
 requests to the local inference server (inference/server.py).

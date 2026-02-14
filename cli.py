@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BlenderModelTraining — Interactive CLI Controller.
+"""Blender Copilot — Interactive CLI Controller.
 
 Launch with:  python cli.py
 
@@ -519,7 +519,7 @@ def screen_serve():
     choice = input(f"  {C.BOLD}▶ {C.END}").strip()
     python = str(VENV_PYTHON)
 
-    if choice in ("1", "2"):
+    if choice == "1":
         # Find best checkpoint
         checkpoint = None
         if CHECKPOINT_DIR.exists():
@@ -658,7 +658,7 @@ def screen_package():
     print(f"  {C.BOLD}📦 Package Blender Plugin{C.END}")
     print(f"  {'─' * 46}\n")
 
-    addon_dir = PROJECT_ROOT.parent / "AIHouseGenerator"
+    addon_dir = PROJECT_ROOT / "addon"
     if not addon_dir.exists():
         print(C.err(f"Addon not found at {addon_dir}"))
         input(f"\n  {C.DIM}Press Enter...{C.END}")
@@ -668,8 +668,7 @@ def screen_package():
     print()
 
     options = [
-        ("1", "Build ZIP (original plugin — OpenAI backend)"),
-        ("2", "Build ZIP with local model support (adds local_client.py)"),
+        ("1", "Build BlenderCopilot.zip (installable addon)"),
         ("0", "← Back"),
     ]
     for k, v in options:
@@ -678,26 +677,25 @@ def screen_package():
 
     choice = input(f"  {C.BOLD}▶ {C.END}").strip()
 
-    if choice in ("1", "2"):
-        zip_name = "AIHouseGenerator.zip"
-        zip_path = PROJECT_ROOT.parent / zip_name
+    if choice == "1":
+        zip_name = "BlenderCopilot.zip"
+        zip_path = PROJECT_ROOT / zip_name
 
         # Collect files
         files = [
             "__init__.py", "properties.py", "preferences.py", "panels.py",
             "operators.py", "ai_engine.py", "blender_tools.py",
-            "materials.py", "oauth.py", "tool_defs.py", "README.md",
+            "materials.py", "tool_defs.py", "README.md",
         ]
 
-        if choice == "2":
-            # Copy local_client to addon dir
-            src = PROJECT_ROOT / "inference" / "local_client.py"
-            dst = addon_dir / "local_client.py"
-            if src.exists():
-                import shutil
-                shutil.copy2(src, dst)
-                files.append("local_client.py")
-                print(f"  {C.ok('Copied local_client.py into addon')}")
+        # Always include local_client (synced from inference/)
+        import shutil
+        src = PROJECT_ROOT / "inference" / "local_client.py"
+        dst = addon_dir / "local_client.py"
+        if src.exists():
+            shutil.copy2(src, dst)
+            files.append("local_client.py")
+            print(f"  {C.ok('Synced local_client.py into addon/')}")
 
         # Build zip
         import zipfile
@@ -707,7 +705,7 @@ def screen_package():
             for fname in files:
                 fpath = addon_dir / fname
                 if fpath.exists():
-                    zf.write(fpath, f"AIHouseGenerator/{fname}")
+                    zf.write(fpath, f"BlenderCopilot/{fname}")
                 else:
                     print(C.warn(f"Missing: {fname}"))
 
