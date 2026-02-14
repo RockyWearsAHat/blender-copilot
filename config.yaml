@@ -1,0 +1,166 @@
+# Global configuration for BlenderModelTraining
+
+project:
+  name: BlenderModelTraining
+  version: 0.1.0
+
+# ── Data Collection ──────────────────────────────────────────────────────
+
+scraping:
+  output_dir: data/raw
+  max_file_size_mb: 200 # Skip .blend files larger than this
+  respect_rate_limits: true
+  user_agent: "BlenderModelTraining/0.1 (research; open-source)"
+
+  blendswap:
+    enabled: true
+    base_url: "https://www.blendswap.com"
+    licenses: ["CC-0", "CC-BY"] # Only free-to-use licenses
+    categories:
+      [
+        "characters",
+        "vehicles",
+        "architecture",
+        "furniture",
+        "nature",
+        "electronics",
+        "animals",
+        "objects",
+        "interior",
+        "exterior",
+        "mechanical",
+        "sci-fi",
+      ]
+    max_pages_per_category: 50
+
+  objaverse:
+    enabled: true
+    max_models: 50000 # How many models to download
+    categories: null # null = all categories
+
+  github:
+    enabled: true
+    search_query: "extension:blend"
+    licenses: ["mit", "apache-2.0", "cc0-1.0", "cc-by-4.0"]
+    max_repos: 5000
+
+  youtube:
+    enabled: true
+    search_queries:
+      - "blender modeling tutorial"
+      - "blender character modeling"
+      - "blender vehicle modeling"
+      - "blender architecture tutorial"
+      - "blender hard surface modeling"
+      - "blender sculpting tutorial"
+      - "blender lamborghini modeling tutorial"
+      - "blender architecture modeling with files"
+      - "how to make a house in blender with files"
+    max_videos_per_query: 500
+    extract_transcripts: true
+
+# ── Data Processing ──────────────────────────────────────────────────────
+
+processing:
+  blender_executable: "blender" # Path to Blender binary
+  output_dir: data/processed
+
+  mesh_extraction:
+    min_vertices: 8 # Skip trivially simple meshes
+    max_vertices: 100000 # Skip overly complex meshes
+    coordinate_precision: 4 # Decimal places for vertex coords
+    normalize: true # Center and scale to unit sphere
+
+  material_extraction:
+    include_node_trees: true
+    include_textures: false # Textures are large — extract separately
+    max_nodes_per_material: 50
+
+  modifier_extraction:
+    include_applied: false # Only extract unapplied modifier stacks
+
+  quality_filter:
+    min_faces: 12 # At least a cube-like object
+    max_non_manifold_ratio: 0.1 # Skip broken meshes
+    require_materials: false
+    deduplicate: true
+    dedup_similarity_threshold: 0.95
+
+# ── Mesh Tokenization ────────────────────────────────────────────────────
+
+tokenization:
+  # MeshGPT-style face tokenization
+  vocab_size: 8192 # Number of quantized coordinate tokens
+  coordinate_range: [-1.0, 1.0] # After normalization
+  max_faces: 2048 # Max faces per training example
+  max_vertices: 4096 # Max vertices per training example
+  face_ordering: "z_curve" # Spatial ordering for faces: z_curve, hilbert, random
+
+  # Sequence format: each face = [v1x, v1y, v1z, v2x, v2y, v2z, v3x, v3y, v3z]
+  # Triangulated meshes for consistent token count per face
+  triangulate: true
+
+# ── Model Configuration ──────────────────────────────────────────────────
+
+models:
+  geometry:
+    architecture: "transformer"
+    hidden_size: 1024
+    num_layers: 24
+    num_heads: 16
+    vocab_size: 8192 # Matches tokenization.vocab_size
+    max_sequence_length: 18432 # max_faces * 9 tokens per tri face
+    dropout: 0.1
+
+  materials:
+    architecture: "transformer"
+    hidden_size: 512
+    num_layers: 12
+    num_heads: 8
+    max_nodes: 50
+
+  modifiers:
+    architecture: "transformer"
+    hidden_size: 256
+    num_layers: 6
+    num_heads: 4
+
+# ── Training ─────────────────────────────────────────────────────────────
+
+training:
+  batch_size: 8
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_steps: 100000
+  eval_every: 1000
+  save_every: 5000
+  gradient_accumulation_steps: 4
+  mixed_precision: "fp16" # fp16, bf16, or fp32
+
+  optimizer: "adamw"
+  scheduler: "cosine"
+
+  # Data augmentation for meshes
+  augmentation:
+    random_rotation: true
+    random_scale: [0.8, 1.2]
+    random_flip: true
+    noise_std: 0.001
+
+# ── Inference ────────────────────────────────────────────────────────────
+
+inference:
+  server_port: 8420
+  device: "auto" # auto, cuda, mps, cpu
+  max_generation_time_seconds: 30
+
+  # Quantization for smaller models / faster inference
+  quantization: null # null, int8, int4
+
+  # Output post-processing
+  postprocess:
+    remove_degenerate_faces: true
+    merge_by_distance: 0.0001
+    recalculate_normals: true
+    smooth_shade: true

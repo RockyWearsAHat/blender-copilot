@@ -1,0 +1,35 @@
+# Core
+torch>=2.1.0
+transformers>=4.36.0
+accelerate>=0.25.0
+safetensors>=0.4.0
+tokenizers>=0.15.0
+
+# Data processing
+numpy>=1.24.0
+scipy>=1.11.0
+trimesh>=4.0.0        # Mesh processing
+open3d>=0.18.0        # Point cloud / mesh ops
+pyyaml>=6.0
+
+# Scraping
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+selenium>=4.15.0      # For JS-heavy sites
+yt-dlp>=2024.1.0      # YouTube transcript extraction
+youtube-transcript-api>=0.6.0
+
+# Training
+wandb>=0.16.0         # Experiment tracking
+datasets>=2.16.0      # HuggingFace datasets
+einops>=0.7.0
+tqdm>=4.66.0
+
+# Inference
+fastapi>=0.109.0
+uvicorn>=0.25.0
+pydantic>=2.5.0
+
+# Dev
+pytest>=7.4.0
+ruff>=0.1.0

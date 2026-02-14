@@ -1,0 +1,55 @@
+# BlenderModelTraining
+
+# Data directories
+data/
+data/raw/
+data/extracted/
+data/filtered/
+data/labeled/
+data/datasets/
+
+# Model checkpoints
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Blender files (downloaded)
+*.blend
+*.blend1
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+wandb/
+runs/
+
+# Misc
+*.zip
+*.tar.gz
+progress_*.json
+nohup.out
