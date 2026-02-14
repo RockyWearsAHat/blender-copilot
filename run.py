@@ -559,8 +559,8 @@ def cmd_serve(args):
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
-    model, tokenizer, device = load_model(checkpoint, config)
-    app = create_app(model, tokenizer, device, config)
+    model, tokenizer, device, text_tokenizer = load_model(checkpoint, config)
+    app = create_app(model, tokenizer, device, config, text_tokenizer=text_tokenizer)
 
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=port)

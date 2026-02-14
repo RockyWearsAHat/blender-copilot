@@ -29,6 +29,7 @@ def load_model(checkpoint_path: str, config: dict, device: str = "auto"):
     """Load a trained geometry model from checkpoint."""
     from models.geometry.model import GeometryModel
     from processing.mesh_tokenizer import MeshTokenizer
+    from processing.text_tokenizer import TextTokenizer
 
     # Determine device
     if device == "auto":
@@ -49,7 +50,7 @@ def load_model(checkpoint_path: str, config: dict, device: str = "auto"):
     model = model.to(dev)
     model.eval()
 
-    # Load tokenizer
+    # Load mesh tokenizer
     tok_config = config.get("tokenization", {})
     tokenizer = MeshTokenizer(
         vocab_size=tok_config.get("vocab_size", 8192),
@@ -57,23 +58,44 @@ def load_model(checkpoint_path: str, config: dict, device: str = "auto"):
         max_faces=tok_config.get("max_faces", 2048),
     )
 
+    # Load text tokenizer
+    text_tokenizer = None
+    # Look for text_tokenizer.json next to the checkpoint, or in datasets
+    cp_dir = Path(checkpoint_path).parent
+    for search_path in [
+        cp_dir / "text_tokenizer.json",
+        cp_dir.parent / "text_tokenizer.json",
+        Path("data/datasets/geometry/text_tokenizer.json"),
+    ]:
+        if search_path.exists():
+            text_tokenizer = TextTokenizer.load(search_path)
+            logger.info(f"Loaded text tokenizer from {search_path}: {text_tokenizer}")
+            break
+
+    if text_tokenizer is None:
+        logger.warning("No text_tokenizer.json found — falling back to character-level")
+
     param_count = model.count_parameters()
     logger.info(f"Model loaded: {param_count:,} parameters ({param_count / 1e6:.1f}M)")
 
-    return model, tokenizer, dev
+    return model, tokenizer, dev, text_tokenizer
 
 
-def text_to_tokens(text: str, max_length: int = 256) -> tuple[torch.Tensor, torch.Tensor]:
+def text_to_tokens(text: str, max_length: int = 256,
+                   text_tokenizer=None) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert text to model input tokens.
 
-    Simple character-level tokenization for v1.
-    Replace with BPE/SentencePiece for production.
+    Uses word-level TextTokenizer if available, falls back to character-level.
     """
-    ids = [ord(c) % 32000 for c in text[:max_length]]
-    mask = [1] * len(ids)
-    # Pad
-    ids = ids + [0] * (max_length - len(ids))
-    mask = mask + [0] * (max_length - len(mask))
+    if text_tokenizer is not None:
+        ids, mask = text_tokenizer.encode_padded(text, max_length=max_length)
+    else:
+        # Legacy fallback
+        ids = [ord(c) % 32000 for c in text[:max_length]]
+        mask = [1] * len(ids)
+        ids = ids + [0] * (max_length - len(ids))
+        mask = mask + [0] * (max_length - len(mask))
+
     return (
         torch.tensor([ids], dtype=torch.long),
         torch.tensor([mask], dtype=torch.float),
@@ -82,14 +104,15 @@ def text_to_tokens(text: str, max_length: int = 256) -> tuple[torch.Tensor, torc
 
 def generate_mesh(model, tokenizer, text: str, device: torch.device,
                   temperature: float = 0.8, top_k: int = 50,
-                  max_faces: int = 2048) -> dict:
+                  max_faces: int = 2048,
+                  text_tokenizer=None) -> dict:
     """Generate a mesh from a text prompt.
 
     Returns structured mesh data ready for injection into Blender.
     """
     start = time.time()
 
-    text_ids, text_mask = text_to_tokens(text)
+    text_ids, text_mask = text_to_tokens(text, text_tokenizer=text_tokenizer)
     text_ids = text_ids.to(device)
     text_mask = text_mask.to(device)
 
@@ -173,7 +196,7 @@ def _clean_name(text: str) -> str:
     return name[:30] or "Generated"
 
 
-def create_app(model, tokenizer, device, config):
+def create_app(model, tokenizer, device, config, text_tokenizer=None):
     """Create FastAPI application."""
     from fastapi import FastAPI
     from pydantic import BaseModel
@@ -206,6 +229,7 @@ def create_app(model, tokenizer, device, config):
             temperature=req.temperature,
             top_k=req.top_k,
             max_faces=req.max_faces,
+            text_tokenizer=text_tokenizer,
         )
         return result
 
@@ -239,8 +263,8 @@ def main():
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    model, tokenizer, device = load_model(args.model, config, args.device)
-    app = create_app(model, tokenizer, device, config)
+    model, tokenizer, device, text_tokenizer = load_model(args.model, config, args.device)
+    app = create_app(model, tokenizer, device, config, text_tokenizer=text_tokenizer)
 
     import uvicorn
     logger.info(f"Starting server on {args.host}:{args.port}")

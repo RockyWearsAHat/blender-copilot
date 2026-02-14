@@ -27,10 +27,12 @@ class MeshDataset(Dataset):
     """Dataset of (text, mesh_tokens) pairs from JSONL files."""
 
     def __init__(self, data_path: str, max_text_length: int = 256,
-                 max_mesh_tokens: int = 18432):
+                 max_mesh_tokens: int = 18432,
+                 text_tokenizer=None):
         self.examples = []
         self.max_text_length = max_text_length
         self.max_mesh_tokens = max_mesh_tokens
+        self.text_tokenizer = text_tokenizer
 
         with open(data_path) as f:
             for line in f:
@@ -45,12 +47,18 @@ class MeshDataset(Dataset):
     def __getitem__(self, idx):
         ex = self.examples[idx]
 
-        # Tokenize text (simple character-level for now — swap for BPE later)
         text = ex["text"]
-        text_ids = [ord(c) % 32000 for c in text[:self.max_text_length]]
-        text_ids = text_ids + [0] * (self.max_text_length - len(text_ids))
-        text_mask = [1] * min(len(text), self.max_text_length)
-        text_mask = text_mask + [0] * (self.max_text_length - len(text_mask))
+
+        if self.text_tokenizer is not None:
+            # Proper word-level tokenizer
+            text_ids, text_mask = self.text_tokenizer.encode_padded(
+                text, max_length=self.max_text_length)
+        else:
+            # Fallback: character-level (legacy compat)
+            text_ids = [ord(c) % 32000 for c in text[:self.max_text_length]]
+            text_ids = text_ids + [0] * (self.max_text_length - len(text_ids))
+            text_mask = [1] * min(len(text), self.max_text_length)
+            text_mask = text_mask + [0] * (self.max_text_length - len(text_mask))
 
         # Mesh tokens (already tokenized in dataset)
         mesh_tokens = ex["tokens"][:self.max_mesh_tokens]
@@ -87,20 +95,35 @@ def train(args):
         device = torch.device("cpu")
     logger.info(f"Using device: {device}")
 
+    # Text tokenizer — build from training data or load saved
+    from processing.text_tokenizer import TextTokenizer
+    dataset_dir = Path(args.dataset)
+    tokenizer_path = dataset_dir / "text_tokenizer.json"
+
+    if tokenizer_path.exists():
+        text_tokenizer = TextTokenizer.load(tokenizer_path)
+        logger.info(f"Loaded text tokenizer: {text_tokenizer}")
+    else:
+        train_jsonl = dataset_dir / "train.jsonl"
+        text_tokenizer = TextTokenizer.from_dataset(train_jsonl)
+        text_tokenizer.save(tokenizer_path)
+        logger.info(f"Built and saved text tokenizer: {text_tokenizer}")
+
     # Model
     model = GeometryModel(config).to(device)
     param_count = model.count_parameters()
     logger.info(f"Model parameters: {param_count:,} ({param_count / 1e6:.1f}M)")
 
     # Data
-    dataset_dir = Path(args.dataset)
     train_dataset = MeshDataset(
         dataset_dir / "train.jsonl",
         max_mesh_tokens=geo_config.get("max_sequence_length", 18432),
+        text_tokenizer=text_tokenizer,
     )
     val_dataset = MeshDataset(
         dataset_dir / "val.jsonl",
         max_mesh_tokens=geo_config.get("max_sequence_length", 18432),
+        text_tokenizer=text_tokenizer,
     )
 
     batch_size = train_config.get("batch_size", 8)
