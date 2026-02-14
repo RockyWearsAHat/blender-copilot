@@ -1,0 +1,15 @@
+{
+  "reportMissingImports": false,
+  "reportMissingModuleSource": false,
+  "reportGeneralTypeIssues": false,
+  "reportCallInDefaultInitializer": false,
+  "typeCheckingMode": "off",
+  "extraPaths": [],
+  "ignore": ["**"],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "reportMissingImports": false
+    }
+  ]
+}

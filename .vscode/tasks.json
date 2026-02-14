@@ -1,0 +1,12 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Rebuild Plugin ZIP",
+      "type": "shell",
+      "command": "cd /Users/alexwaldmann/blenderPlugins && rm -f AIHouseGenerator.zip && zip -r AIHouseGenerator.zip AIHouseGenerator/__init__.py AIHouseGenerator/properties.py AIHouseGenerator/preferences.py AIHouseGenerator/panels.py AIHouseGenerator/operators.py AIHouseGenerator/ai_engine.py AIHouseGenerator/blender_tools.py AIHouseGenerator/materials.py AIHouseGenerator/tool_defs.py AIHouseGenerator/oauth.py AIHouseGenerator/README.md -x '*.pyc' '*__pycache__*' '*.DS_Store' '*chat_logs*' '*_backup*' && echo '✅ AIHouseGenerator.zip rebuilt successfully'",
+      "problemMatcher": [],
+      "group": "build"
+    }
+  ]
+}
