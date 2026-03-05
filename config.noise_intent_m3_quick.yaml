@@ -1,0 +1,18 @@
+model:
+  feat_dim: 64
+  hidden_dim: 128
+  layers: 2
+  dropout: 0.1
+  bins: 32
+
+training:
+  device: auto
+  seed: 0
+  epochs: 25
+  batch_size: 64
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  samples_per_prototype: 1200
+
+output:
+  checkpoint: checkpoints/noise_intent/latest.pt

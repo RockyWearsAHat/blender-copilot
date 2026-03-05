@@ -1,0 +1,10 @@
+{
+  "checkpoint": "checkpoints/retrain_v1024_focal/best.pt",
+  "checkpoint_arg": "checkpoints/retrain_v1024_focal/best.pt",
+  "config": "config.yaml",
+  "device": "cpu",
+  "health_url": "http://127.0.0.1:8420/health",
+  "pid": 69141,
+  "port": 8420,
+  "timestamp": "2026-02-28T15:31:39"
+}

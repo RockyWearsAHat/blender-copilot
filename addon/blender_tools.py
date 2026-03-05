@@ -26,7 +26,14 @@ import bpy  # type: ignore
 import bmesh  # type: ignore
 import math
 import os
-from mathutils import Vector, Matrix, Euler  # type: ignore
+from mathutils import Vector, Matrix  # type: ignore
+
+# Re-export procedural materials so they're available in execute_code
+try:
+    from .materials import (make_stucco, make_brick, make_wood, make_concrete,  # noqa: F401
+                            make_stone, make_glass, make_metal, make_grass)  # noqa: F401
+except ImportError:
+    pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -138,8 +145,6 @@ def create_torus(name="Torus", major_radius=1, minor_radius=0.25,
     # Build torus manually via revolution
     for i in range(major_segments):
         angle_major = 2 * math.pi * i / major_segments
-        cx = major_radius * math.cos(angle_major)
-        cy = major_radius * math.sin(angle_major)
         for j in range(minor_segments):
             angle_minor = 2 * math.pi * j / minor_segments
             r = major_radius + minor_radius * math.cos(angle_minor)
@@ -266,21 +271,51 @@ def get_material_inventory():
     return "\n".join(lines)
 
 
+def _parse_color(color):
+    """Normalize a color value to (R, G, B) floats in 0-1 range.
+    Accepts: tuple/list of 3-4 floats, hex string '#RRGGBB', single float (grey).
+    """
+    if isinstance(color, str):
+        c = color.lstrip('#')
+        if len(c) == 6:
+            return (int(c[0:2], 16) / 255.0,
+                    int(c[2:4], 16) / 255.0,
+                    int(c[4:6], 16) / 255.0)
+        return (0.8, 0.8, 0.8)
+    if isinstance(color, (int, float)):
+        v = float(color)
+        return (v, v, v)
+    if hasattr(color, '__len__') and len(color) >= 3:
+        return (float(color[0]), float(color[1]), float(color[2]))
+    return (0.8, 0.8, 0.8)
+
+
+def _find_principled_bsdf(node_tree):
+    """Find the Principled BSDF node by type (not by name, for Blender 4.x compat)."""
+    for node in node_tree.nodes:
+        if node.type == 'BSDF_PRINCIPLED':
+            return node
+    return None
+
+
 def quick_material(name="Material", color=(0.8, 0.8, 0.8),
                    roughness=0.5, metallic=0.0):
     """Create or reuse a Principled BSDF material. Reuses an existing material
-    with the same name if it exists, or one with similar colour/properties."""
-    # Check for exact name match first
+    with the same name if it exists, or one with similar colour/properties.
+    Color can be a tuple (R,G,B), hex string '#RRGGBB', or single float (grey).
+    """
+    color = _parse_color(color)
+    roughness = max(0.0, min(1.0, float(roughness)))
+    metallic = max(0.0, min(1.0, float(metallic)))
     existing = bpy.data.materials.get(name)
     if existing:
         return existing
-    # Check for similar material
     similar = find_similar_material(color, roughness, metallic, tolerance=0.05)
     if similar:
         return similar
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
-    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    bsdf = _find_principled_bsdf(mat.node_tree)
     if bsdf:
         bsdf.inputs['Base Color'].default_value = (
             color[0], color[1], color[2], 1.0)
@@ -292,9 +327,10 @@ def quick_material(name="Material", color=(0.8, 0.8, 0.8),
 def glass_material(name="Glass", color=(0.9, 0.95, 1.0),
                    roughness=0.0, ior=1.5):
     """Create a glass material with transmission."""
+    color = _parse_color(color)
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
-    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    bsdf = _find_principled_bsdf(mat.node_tree)
     if bsdf:
         bsdf.inputs['Base Color'].default_value = (
             color[0], color[1], color[2], 1.0)
@@ -329,6 +365,78 @@ def assign_material(obj, mat):
     if obj and obj.data:
         obj.data.materials.clear()
         obj.data.materials.append(mat)
+
+
+def add_material_slot(obj, mat):
+    """Add a material to an object WITHOUT clearing existing materials.
+    Returns the material slot index. If the material is already assigned,
+    returns the existing slot index."""
+    if not obj or not obj.data:
+        return -1
+    for i, slot in enumerate(obj.material_slots):
+        if slot.material and slot.material == mat:
+            return i
+    obj.data.materials.append(mat)
+    return len(obj.material_slots) - 1
+
+
+def assign_material_to_faces(obj, mat, face_indices):
+    """Assign a material to specific faces of a mesh object by face index.
+    Adds the material as a new slot (preserves existing materials on other faces).
+    face_indices: list of polygon indices, or 'all' for every face.
+    Example: assign_material_to_faces(bowl, wood_mat, [0, 1, 2, 3])
+    Example: assign_material_to_faces(bowl, clay_mat, range(20, 50))
+    """
+    if not obj or obj.type != 'MESH' or not obj.data:
+        return {"error": "Object is None or not a mesh"}
+    slot_idx = add_material_slot(obj, mat)
+    if slot_idx < 0:
+        return {"error": "Could not add material slot"}
+    mesh = obj.data
+    if face_indices == 'all':
+        face_indices = range(len(mesh.polygons))
+    count = 0
+    for fi in face_indices:
+        if 0 <= fi < len(mesh.polygons):
+            mesh.polygons[fi].material_index = slot_idx
+            count += 1
+    mesh.update()
+    return {"slot": slot_idx, "faces_assigned": count,
+            "total_faces": len(mesh.polygons)}
+
+
+def get_face_count(obj):
+    """Return the number of faces (polygons) on a mesh object."""
+    if obj and obj.type == 'MESH' and obj.data:
+        return len(obj.data.polygons)
+    return 0
+
+
+def assign_material_by_normal(obj, mat, axis='Z', direction='UP',
+                              threshold=0.5):
+    """Assign a material to faces based on their normal direction.
+    Useful for applying different materials to top/bottom/sides of a mesh.
+    axis: 'X', 'Y', or 'Z'
+    direction: 'UP' (positive) or 'DOWN' (negative) along that axis
+    threshold: dot product threshold (0.5 = within 60 degrees of axis)
+    Example: assign_material_by_normal(bowl, rim_mat, 'Z', 'UP', 0.7)
+    """
+    if not obj or obj.type != 'MESH':
+        return {"error": "Object is None or not a mesh"}
+    axis_map = {'X': 0, 'Y': 1, 'Z': 2}
+    ai = axis_map.get(axis.upper(), 2)
+    sign = 1.0 if direction.upper() == 'UP' else -1.0
+    slot_idx = add_material_slot(obj, mat)
+    mesh = obj.data
+    mesh.calc_normals()
+    count = 0
+    for poly in mesh.polygons:
+        if poly.normal[ai] * sign >= threshold:
+            poly.material_index = slot_idx
+            count += 1
+    mesh.update()
+    return {"slot": slot_idx, "faces_assigned": count,
+            "total_faces": len(mesh.polygons)}
 
 
 def set_color(obj, r, g, b, roughness=0.5, metallic=0.0):
@@ -516,13 +624,25 @@ def apply_modifiers(obj):
     Note: applying a bevel on a simple 8-vert box adds very few verts.
     If you need more topology for booleans to work cleanly, use
     subdivide_mesh() to add edge loops first.
+
+    Returns a dict with applied/failed counts so the AI can see what happened.
     """
-    try:
-        with bpy.context.temp_override(object=obj):
-            for mod in list(obj.modifiers):
+    if not obj or not obj.modifiers:
+        return {"applied": 0, "failed": 0, "remaining": 0}
+    applied = 0
+    failed = []
+    for mod in list(obj.modifiers):
+        try:
+            with bpy.context.temp_override(object=obj):
                 bpy.ops.object.modifier_apply(modifier=mod.name)
-    except Exception:
-        pass
+            applied += 1
+        except Exception as e:
+            failed.append("%s: %s" % (mod.name, str(e)[:100]))
+    result = {"applied": applied, "failed": len(failed),
+              "remaining": len(obj.modifiers)}
+    if failed:
+        result["errors"] = failed
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -956,7 +1076,7 @@ def loop_cut(obj, edge_index=0, cuts=1, offset=0.0):
 
     if edge_index < len(bm.edges):
         edge = bm.edges[edge_index]
-        result = bmesh.ops.subdivide_edges(
+        bmesh.ops.subdivide_edges(
             bm, edges=[edge], cuts=cuts, use_grid_fill=True)
 
     bm.to_mesh(mesh)
@@ -1228,29 +1348,6 @@ def offset_edges(obj, edge_indices=None, offset=0.1):
     bm.free()
     mesh.update()
     return obj
-
-
-def select_faces_by_normal(obj, direction=(0, 0, 1), threshold_deg=45):
-    """Return a list of face indices whose normals point in *direction*
-    within *threshold_deg* degrees. Useful for selecting 'top faces',
-    'side faces', etc.
-    """
-    mesh = obj.data
-    bm = bmesh.new()
-    bm.from_mesh(mesh)
-    bm.faces.ensure_lookup_table()
-
-    dir_vec = Vector(direction).normalized()
-    threshold = math.cos(math.radians(threshold_deg))
-
-    indices = []
-    for face in bm.faces:
-        dot = face.normal.dot(dir_vec)
-        if dot >= threshold:
-            indices.append(face.index)
-
-    bm.free()
-    return indices
 
 
 def select_faces_by_area(obj, min_area=0.0, max_area=float('inf')):
@@ -1852,7 +1949,6 @@ def noise_texture_material(name="Procedural", base_color=(0.6, 0.5, 0.4),
     links = mat.node_tree.links
 
     bsdf = nodes.get("Principled BSDF")
-    output = nodes.get("Material Output")
 
     # Noise texture
     noise = nodes.new('ShaderNodeTexNoise')
@@ -2906,9 +3002,9 @@ def knife_cut(obj, cut_coords, face_indices=None):
     bm.faces.ensure_lookup_table()
 
     if face_indices is not None:
-        faces = [bm.faces[i] for i in face_indices if i < len(bm.faces)]
+        _faces = [bm.faces[i] for i in face_indices if i < len(bm.faces)]  # noqa: F841
     else:
-        faces = list(bm.faces)
+        _faces = list(bm.faces)  # noqa: F841
 
     # Build pairs for knife
     edges = []
@@ -3202,6 +3298,73 @@ def join_and_merge(objects, merge_distance=0.001):
     if result:
         merge_by_distance(result, distance=merge_distance)
     return result
+
+
+def join_objects_with_cleanup(objects, merge_distance=0.001,
+                              recalc_outside=True, boolean_cleanup=False):
+    """Join parts and run weld/normal cleanup for decomposed generation flows."""
+    if not objects:
+        return None
+    result = join_objects(objects)
+    if result is None:
+        return None
+    try:
+        merge_by_distance(result, distance=merge_distance)
+    except Exception:
+        pass
+    if boolean_cleanup:
+        try:
+            tris_to_quads(result)
+        except Exception:
+            pass
+    if recalc_outside:
+        try:
+            recalc_normals(result, inside=False)
+        except Exception:
+            pass
+    return result
+
+
+def apply_suggested_modifiers(obj, object_type="auto"):
+    """Apply a lightweight object-type-based modifier preset.
+
+    Returns a list of modifier names that were added.
+    """
+    if obj is None:
+        return []
+
+    t = (object_type or "auto").lower()
+    applied = []
+
+    try:
+        if t == "auto":
+            name = obj.name.lower()
+            if any(k in name for k in ("car", "vehicle", "robot", "weapon", "engine", "hard")):
+                t = "hard_surface"
+            elif any(k in name for k in ("character", "head", "face", "creature", "animal", "organic")):
+                t = "organic"
+            elif any(k in name for k in ("building", "house", "wall", "architecture", "room")):
+                t = "architectural"
+            else:
+                t = "default"
+
+        if t == "organic":
+            applied.append(subsurf(obj, levels=3).name)
+            applied.append(bevel(obj, width=0.004, segments=2).name)
+        elif t == "hard_surface":
+            applied.append(bevel(obj, width=0.01, segments=2).name)
+            applied.append(subsurf(obj, levels=1).name)
+            mod = obj.modifiers.new("WeightedNormal", 'WEIGHTED_NORMAL')
+            applied.append(mod.name)
+        elif t == "architectural":
+            applied.append(solidify(obj, thickness=0.05).name)
+            applied.append(bevel(obj, width=0.015, segments=2).name)
+        else:
+            applied.append(subsurf(obj, levels=2).name)
+    except Exception:
+        return applied
+
+    return applied
 
 
 def snap_object_to(obj, target, snap='BOTTOM_TO_TOP', offset=0.0):
@@ -4215,7 +4378,7 @@ def add_detail_cuts(obj, axis='X', num_cuts=3):
         plane_co[ax] = pos
 
         geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
-        result = bmesh.ops.bisect_plane(
+        bmesh.ops.bisect_plane(
             bm, geom=geom,
             plane_co=Vector(plane_co),
             plane_no=Vector(plane_no),
@@ -4434,9 +4597,9 @@ def thicken(obj, thickness=0.05, offset=-1):
     mod = obj.modifiers.new("Thicken", 'SOLIDIFY')
     mod.thickness = thickness
     mod.offset = offset
-    bpy.context.view_layer.objects.active = obj
     try:
-        bpy.ops.object.modifier_apply(modifier=mod.name)
+        with bpy.context.temp_override(object=obj):
+            bpy.ops.object.modifier_apply(modifier=mod.name)
     except Exception:
         pass
     return obj
@@ -4839,3 +5002,3471 @@ def place_at_bounds(obj, target, position='TOP', offset=0.0, axis=None):
 
     move_to(obj, x, y, z)
     return obj
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Vertex and Face Selection/Editing — For Iterative Mesh Refinement
+# ══════════════════════════════════════════════════════════════════════════════
+
+def select_vertices_by_location(obj, axis='Z', min_val=None, max_val=None):
+    """Select vertices within a range on an axis.
+    
+    Returns list of vertex indices for use with move_vertices.
+    Example: verts = select_vertices_by_location(obj, 'Z', min_val=2.0)
+    """
+    import bmesh as _bm
+    
+    bm = _bm.new()
+    bm.from_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    
+    axis_idx = {'X': 0, 'Y': 1, 'Z': 2}[axis.upper()]
+    selected = []
+    
+    for i, v in enumerate(bm.verts):
+        coord = v.co[axis_idx]
+        if min_val is not None and coord < min_val:
+            continue
+        if max_val is not None and coord > max_val:
+            continue
+        selected.append(i)
+    
+    bm.free()
+    return selected
+
+
+def select_faces_by_normal(obj, direction=(0, 0, 1), threshold=0.7):
+    """Select faces pointing in a direction (for material assignment or extrusion).
+    
+    Returns list of face indices.
+    direction: (x, y, z) vector, e.g. (0, 0, 1) for upward-facing
+    threshold: dot product threshold (0.7 = faces within ~45° of direction)
+    
+    Example: top_faces = select_faces_by_normal(car, (0, 0, 1), 0.8)
+             assign_material_to_faces(car, paint_mat, top_faces)
+    """
+    import bmesh as _bm
+    from mathutils import Vector
+    
+    bm = _bm.new()
+    bm.from_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    
+    dir_vec = Vector(direction).normalized()
+    selected = []
+    
+    for i, f in enumerate(bm.faces):
+        if f.normal.dot(dir_vec) >= threshold:
+            selected.append(i)
+    
+    bm.free()
+    return selected
+
+
+def move_vertices(obj, vertex_indices, offset=(0, 0, 0), relative=True):
+    """Move specific vertices by an offset or to absolute position.
+    
+    Example: verts = select_vertices_by_location(obj, 'Z', min_val=2.0)
+             move_vertices(obj, verts, offset=(0, 0, 0.5))  # lift top vertices
+    """
+    import bmesh as _bm
+    from mathutils import Vector
+    
+    bm = _bm.new()
+    bm.from_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    
+    offset_vec = Vector(offset)
+    for i in vertex_indices:
+        if i < len(bm.verts):
+            if relative:
+                bm.verts[i].co += offset_vec
+            else:
+                bm.verts[i].co = offset_vec
+    
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+    return obj
+
+
+def scale_vertices(obj, vertex_indices, scale=(1, 1, 1), pivot='center'):
+    """Scale specific vertices around a pivot point.
+    
+    pivot: 'center' (center of selected verts), 'origin' (object origin), or (x,y,z) tuple
+    Example: rim_verts = select_vertices_by_location(bowl, 'Z', min_val=1.5)
+             scale_vertices(bowl, rim_verts, scale=(1.2, 1.2, 1.0))
+    """
+    import bmesh as _bm
+    from mathutils import Vector
+    
+    bm = _bm.new()
+    bm.from_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    
+    # Calculate pivot
+    if pivot == 'center':
+        center = Vector((0, 0, 0))
+        count = 0
+        for i in vertex_indices:
+            if i < len(bm.verts):
+                center += bm.verts[i].co
+                count += 1
+        if count > 0:
+            center /= count
+    elif pivot == 'origin':
+        center = Vector((0, 0, 0))
+    else:
+        center = Vector(pivot)
+    
+    scale_vec = Vector(scale)
+    for i in vertex_indices:
+        if i < len(bm.verts):
+            v = bm.verts[i]
+            offset = v.co - center
+            v.co = center + Vector((offset.x * scale_vec.x, 
+                                     offset.y * scale_vec.y,
+                                     offset.z * scale_vec.z))
+    
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+    return obj
+
+
+def smooth_vertices(obj, vertex_indices, iterations=1, factor=0.5):
+    """Smooth specific vertices by averaging with neighbors.
+    
+    Example: sharp_verts = select_vertices_by_location(obj, 'Z', 0.9, 1.1)
+             smooth_vertices(obj, sharp_verts, iterations=2, factor=0.7)
+    """
+    import bmesh as _bm
+    from mathutils import Vector
+    
+    bm = _bm.new()
+    bm.from_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    
+    for _ in range(iterations):
+        new_positions = {}
+        for i in vertex_indices:
+            if i >= len(bm.verts):
+                continue
+            v = bm.verts[i]
+            
+            # Average with connected vertices
+            neighbors = []
+            for edge in v.link_edges:
+                other = edge.other_vert(v)
+                neighbors.append(other.co)
+            
+            if neighbors:
+                avg = Vector((0, 0, 0))
+                for n_co in neighbors:
+                    avg += n_co
+                avg /= len(neighbors)
+                
+                # Blend between original and average
+                new_positions[i] = v.co.lerp(avg, factor)
+        
+        # Apply new positions
+        for i, new_co in new_positions.items():
+            bm.verts[i].co = new_co
+    
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+    return obj
+
+
+def get_vertex_positions(obj, vertex_indices=None):
+    """Get current positions of vertices (for inspection/debugging).
+    
+    Returns: list of (x, y, z) tuples
+    Example: verts = select_vertices_by_location(obj, 'Z', min_val=2.0)
+             positions = get_vertex_positions(obj, verts)
+    """
+    import bmesh as _bm
+    
+    bm = _bm.new()
+    bm.from_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    
+    if vertex_indices is None:
+        vertex_indices = range(len(bm.verts))
+    
+    positions = []
+    for i in vertex_indices:
+        if i < len(bm.verts):
+            co = bm.verts[i].co
+            positions.append((co.x, co.y, co.z))
+    
+    bm.free()
+    return positions
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ANIMATION & KEYFRAMING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def set_frame_range(start=1, end=250):
+    """Set the scene playback frame range.
+
+    Example: set_frame_range(1, 120)  # 5 seconds at 24fps
+    """
+    import bpy
+    bpy.context.scene.frame_start = start
+    bpy.context.scene.frame_end = end
+    return {"start": start, "end": end}
+
+
+def set_current_frame(frame=1):
+    """Set the current frame (playhead position).
+
+    Example: set_current_frame(30)
+    """
+    import bpy
+    bpy.context.scene.frame_set(frame)
+    return frame
+
+
+def set_fps(fps=24):
+    """Set scene frames per second.
+
+    Example: set_fps(30)
+    """
+    import bpy
+    bpy.context.scene.render.fps = fps
+    return fps
+
+
+def insert_keyframe(obj, data_path='location', frame=None, index=-1):
+    """Insert a keyframe on an object property.
+
+    data_path: 'location', 'rotation_euler', 'scale', 'hide_viewport',
+               'hide_render', or any animatable property path.
+    frame: frame number (None = current frame).
+    index: channel index (-1 = all channels, 0=X, 1=Y, 2=Z).
+
+    Example:
+        move_to(cube, 0, 0, 0)
+        insert_keyframe(cube, 'location', frame=1)
+        move_to(cube, 5, 0, 3)
+        insert_keyframe(cube, 'location', frame=60)
+    """
+    import bpy
+    if frame is not None:
+        bpy.context.scene.frame_set(frame)
+    obj.keyframe_insert(data_path=data_path, index=index,
+                        frame=frame or bpy.context.scene.frame_current)
+    return {"object": obj.name, "data_path": data_path,
+            "frame": frame or bpy.context.scene.frame_current}
+
+
+def delete_keyframe(obj, data_path='location', frame=None, index=-1):
+    """Delete a keyframe from an object property.
+
+    Example: delete_keyframe(cube, 'location', frame=30)
+    """
+    import bpy
+    f = frame or bpy.context.scene.frame_current
+    obj.keyframe_delete(data_path=data_path, index=index, frame=f)
+    return {"object": obj.name, "data_path": data_path, "frame": f}
+
+
+def clear_animation(obj):
+    """Remove all animation data from an object.
+
+    Example: clear_animation(cube)
+    """
+    obj.animation_data_clear()
+    return {"object": obj.name, "status": "animation cleared"}
+
+
+def animate_location(obj, keyframes):
+    """Animate object location over multiple frames.
+
+    keyframes: list of (frame, (x, y, z)) tuples.
+
+    Example:
+        animate_location(cube, [
+            (1,  (0, 0, 0)),
+            (30, (5, 0, 0)),
+            (60, (5, 5, 3)),
+        ])
+    """
+    import bpy
+    for frame, loc in keyframes:
+        obj.location = loc
+        obj.keyframe_insert(data_path='location', frame=frame)
+    bpy.context.scene.frame_set(keyframes[0][0])
+    return {"object": obj.name, "keyframes": len(keyframes)}
+
+
+def animate_rotation(obj, keyframes, mode='euler'):
+    """Animate object rotation over multiple frames.
+
+    keyframes: list of (frame, (rx, ry, rz)) tuples (degrees for euler).
+    mode: 'euler' or 'quaternion'.
+
+    Example:
+        animate_rotation(fan, [
+            (1,  (0, 0, 0)),
+            (60, (0, 0, 360)),
+        ])
+    """
+    import bpy
+    import math
+    for frame, rot in keyframes:
+        if mode == 'euler':
+            obj.rotation_euler = tuple(math.radians(r) for r in rot)
+            obj.keyframe_insert(data_path='rotation_euler', frame=frame)
+        else:
+            obj.rotation_quaternion = rot
+            obj.keyframe_insert(data_path='rotation_quaternion', frame=frame)
+    bpy.context.scene.frame_set(keyframes[0][0])
+    return {"object": obj.name, "keyframes": len(keyframes)}
+
+
+def animate_scale(obj, keyframes):
+    """Animate object scale over multiple frames.
+
+    keyframes: list of (frame, (sx, sy, sz)) tuples.
+
+    Example:
+        animate_scale(ball, [(1, (1,1,1)), (30, (2,2,2)), (60, (1,1,1))])
+    """
+    import bpy
+    for frame, sc in keyframes:
+        obj.scale = sc
+        obj.keyframe_insert(data_path='scale', frame=frame)
+    bpy.context.scene.frame_set(keyframes[0][0])
+    return {"object": obj.name, "keyframes": len(keyframes)}
+
+
+def animate_value(obj, data_path, keyframes, index=-1):
+    """Animate any animatable property over multiple frames.
+
+    keyframes: list of (frame, value) tuples.
+
+    Example:
+        # Animate material emission strength
+        mat = obj.active_material
+        animate_value(mat, 'node_tree.nodes["Emission"].inputs[1].default_value',
+                      [(1, 0), (30, 10), (60, 0)])
+    """
+    for frame, value in keyframes:
+        try:
+            parts = data_path.rsplit('.', 1)
+            if len(parts) == 2:
+                parent = obj.path_resolve(parts[0])
+                setattr(parent, parts[1], value)
+            else:
+                setattr(obj, data_path, value)
+        except Exception:
+            exec(f"obj.{data_path} = {value!r}")
+        obj.keyframe_insert(data_path=data_path, index=index, frame=frame)
+    return {"object": obj.name, "data_path": data_path,
+            "keyframes": len(keyframes)}
+
+
+def set_interpolation(obj, interpolation='BEZIER', data_path=None):
+    """Set keyframe interpolation for an object's F-Curves.
+
+    interpolation: 'CONSTANT', 'LINEAR', 'BEZIER', 'SINE', 'QUAD',
+                   'CUBIC', 'QUART', 'QUINT', 'EXPO', 'CIRC',
+                   'BACK', 'BOUNCE', 'ELASTIC'.
+    data_path: filter to specific property (None = all).
+
+    Example: set_interpolation(cube, 'LINEAR')
+             set_interpolation(cube, 'CONSTANT', data_path='hide_viewport')
+    """
+    if not obj.animation_data or not obj.animation_data.action:
+        return {"error": "no animation data"}
+    count = 0
+    for fc in obj.animation_data.action.fcurves:
+        if data_path and fc.data_path != data_path:
+            continue
+        for kp in fc.keyframe_points:
+            kp.interpolation = interpolation
+            count += 1
+    return {"object": obj.name, "interpolation": interpolation,
+            "keyframes_updated": count}
+
+
+def set_extrapolation(obj, extrapolation='CONSTANT', data_path=None):
+    """Set F-Curve extrapolation mode (what happens beyond keyframes).
+
+    extrapolation: 'CONSTANT' (hold last value), 'LINEAR' (continue slope),
+                   'MAKE_CYCLIC' (loop).
+
+    Example: set_extrapolation(spinner, 'MAKE_CYCLIC')
+    """
+    if not obj.animation_data or not obj.animation_data.action:
+        return {"error": "no animation data"}
+    count = 0
+    for fc in obj.animation_data.action.fcurves:
+        if data_path and fc.data_path != data_path:
+            continue
+        if extrapolation == 'MAKE_CYCLIC':
+            fc.modifiers.new(type='CYCLES')
+            count += 1
+        else:
+            fc.extrapolation = extrapolation
+            count += 1
+    return {"object": obj.name, "extrapolation": extrapolation,
+            "curves_updated": count}
+
+
+def create_action(name="Action"):
+    """Create a new empty Action (animation clip).
+
+    Example: action = create_action("WalkCycle")
+    """
+    import bpy
+    action = bpy.data.actions.new(name=name)
+    return action
+
+
+def set_action(obj, action):
+    """Assign an Action to an object.
+
+    Example:
+        action = create_action("Bounce")
+        set_action(cube, action)
+    """
+    if not obj.animation_data:
+        obj.animation_data_create()
+    obj.animation_data.action = action
+    return {"object": obj.name, "action": action.name}
+
+
+def push_to_nla(obj, track_name="Track", start_frame=1):
+    """Push the active action to an NLA track (non-destructive stacking).
+
+    Example:
+        push_to_nla(character, "WalkCycle", start_frame=1)
+    """
+    if not obj.animation_data or not obj.animation_data.action:
+        return {"error": "no active action to push"}
+    action = obj.animation_data.action
+    track = obj.animation_data.nla_tracks.new()
+    track.name = track_name
+    strip = track.strips.new(action.name, int(start_frame), action)
+    obj.animation_data.action = None
+    return {"object": obj.name, "track": track_name,
+            "action": action.name, "strip": strip.name}
+
+
+def add_follow_path(obj, curve_obj, use_curve_follow=True,
+                    forward_axis='FORWARD_X', up_axis='UP_Z'):
+    """Make an object follow a curve path.
+
+    Example:
+        path = create_bezier_curve("Path", points=[(0,0,0),(5,0,0),(10,5,0)])
+        add_follow_path(car, path)
+    """
+    con = obj.constraints.new(type='FOLLOW_PATH')
+    con.target = curve_obj
+    con.use_curve_follow = use_curve_follow
+    con.forward_axis = forward_axis
+    con.up_axis = up_axis
+    if curve_obj.data and hasattr(curve_obj.data, 'path_duration'):
+        curve_obj.data.path_duration = 100
+    return {"object": obj.name, "constraint": con.name,
+            "curve": curve_obj.name}
+
+
+def add_marker(name="Marker", frame=None):
+    """Add a timeline marker at the given frame.
+
+    Example: add_marker("Explosion", frame=45)
+    """
+    import bpy
+    f = frame or bpy.context.scene.frame_current
+    bpy.context.scene.timeline_markers.new(name, frame=f)
+    return {"name": name, "frame": f}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ARMATURE & RIGGING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def create_armature(name="Armature", location=(0, 0, 0)):
+    """Create an empty armature object. Add bones with add_bone().
+
+    Example:
+        arm = create_armature("CharacterRig")
+        add_bone(arm, "spine", head=(0,0,0), tail=(0,0,0.5))
+    """
+    import bpy
+    armature_data = bpy.data.armatures.new(name)
+    arm_obj = bpy.data.objects.new(name, armature_data)
+    bpy.context.collection.objects.link(arm_obj)
+    arm_obj.location = location
+    return arm_obj
+
+
+def add_bone(armature_obj, name="Bone", head=(0, 0, 0), tail=(0, 0, 1),
+             parent_bone=None, connected=False, roll=0):
+    """Add a bone to an armature. Must provide head and tail positions.
+
+    parent_bone: name of parent bone (string) or None.
+    connected: if True, bone's head is fused to parent's tail.
+
+    Example:
+        arm = create_armature("Rig")
+        add_bone(arm, "spine",      head=(0,0,0),   tail=(0,0,0.5))
+        add_bone(arm, "chest",      head=(0,0,0.5), tail=(0,0,1.0),
+                 parent_bone="spine", connected=True)
+        add_bone(arm, "upper_arm.L", head=(0.3,0,0.9), tail=(0.7,0,0.7),
+                 parent_bone="chest")
+    """
+    import bpy
+    bpy.context.view_layer.objects.active = armature_obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    try:
+        bone = armature_obj.data.edit_bones.new(name)
+        bone.head = head
+        bone.tail = tail
+        bone.roll = roll
+        if parent_bone:
+            parent = armature_obj.data.edit_bones.get(parent_bone)
+            if parent:
+                bone.parent = parent
+                bone.use_connect = connected
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+    return {"armature": armature_obj.name, "bone": name,
+            "head": list(head), "tail": list(tail)}
+
+
+def extrude_bone(armature_obj, parent_bone_name, name="NewBone",
+                 tail_offset=(0, 0, 0.5)):
+    """Extrude a new bone from the tail of an existing bone.
+
+    Example:
+        extrude_bone(arm, "spine", "chest", tail_offset=(0, 0, 0.5))
+    """
+    import bpy
+    from mathutils import Vector
+    bpy.context.view_layer.objects.active = armature_obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    try:
+        parent = armature_obj.data.edit_bones.get(parent_bone_name)
+        if not parent:
+            return {"error": f"bone '{parent_bone_name}' not found"}
+        bone = armature_obj.data.edit_bones.new(name)
+        bone.head = parent.tail.copy()
+        bone.tail = parent.tail + Vector(tail_offset)
+        bone.parent = parent
+        bone.use_connect = True
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+    return {"armature": armature_obj.name, "bone": name}
+
+
+def create_bone_chain(armature_obj, chain_name, joints, parent_bone=None):
+    """Create a chain of connected bones from a list of joint positions.
+
+    joints: list of (x, y, z) positions. N positions = N-1 bones.
+
+    Example:
+        arm = create_armature("Snake")
+        create_bone_chain(arm, "segment", [
+            (0,0,0), (0,0.5,0), (0,1,0), (0,1.5,0.2), (0,2,0.5)
+        ])
+    """
+    import bpy
+    bpy.context.view_layer.objects.active = armature_obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    bones_created = []
+    try:
+        prev_bone = None
+        if parent_bone:
+            prev_bone = armature_obj.data.edit_bones.get(parent_bone)
+        for i in range(len(joints) - 1):
+            bname = f"{chain_name}_{i+1:02d}"
+            bone = armature_obj.data.edit_bones.new(bname)
+            bone.head = joints[i]
+            bone.tail = joints[i + 1]
+            if prev_bone:
+                bone.parent = prev_bone
+                bone.use_connect = (i > 0 or parent_bone is not None)
+            prev_bone = bone
+            bones_created.append(bname)
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+    return {"armature": armature_obj.name, "bones": bones_created}
+
+
+def parent_to_armature(mesh_obj, armature_obj, method='ARMATURE_AUTO'):
+    """Parent a mesh to an armature with automatic weight painting.
+
+    method: 'ARMATURE_AUTO' (automatic weights), 'ARMATURE_NAME'
+            (vertex groups by name), 'ARMATURE_ENVELOPE' (by bone envelope).
+
+    Example:
+        parent_to_armature(character_mesh, rig, method='ARMATURE_AUTO')
+    """
+    import bpy
+    bpy.ops.object.select_all(action='DESELECT')
+    mesh_obj.select_set(True)
+    armature_obj.select_set(True)
+    bpy.context.view_layer.objects.active = armature_obj
+    bpy.ops.object.parent_set(type=method)
+    return {"mesh": mesh_obj.name, "armature": armature_obj.name,
+            "method": method}
+
+
+def set_bone_ik(armature_obj, bone_name, target_obj=None,
+                chain_length=0, pole_target=None, pole_angle=0):
+    """Add an Inverse Kinematics constraint to a bone.
+
+    chain_length: 0 = entire chain. N = N bones up the chain.
+
+    Example:
+        set_bone_ik(rig, "hand.L", target_obj=ik_target, chain_length=3)
+    """
+    import bpy
+    import math
+    bpy.context.view_layer.objects.active = armature_obj
+    bpy.ops.object.mode_set(mode='POSE')
+    try:
+        pose_bone = armature_obj.pose.bones.get(bone_name)
+        if not pose_bone:
+            return {"error": f"pose bone '{bone_name}' not found"}
+        ik = pose_bone.constraints.new('IK')
+        ik.target = target_obj
+        ik.chain_count = chain_length
+        if pole_target:
+            ik.pole_target = pole_target
+            ik.pole_angle = math.radians(pole_angle)
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+    return {"armature": armature_obj.name, "bone": bone_name,
+            "constraint": "IK"}
+
+
+def add_bone_constraint(armature_obj, bone_name, constraint_type,
+                        target_obj=None, **kwargs):
+    """Add a constraint to a pose bone.
+
+    constraint_type: 'COPY_LOCATION', 'COPY_ROTATION', 'COPY_SCALE',
+                     'TRACK_TO', 'DAMPED_TRACK', 'STRETCH_TO',
+                     'LIMIT_ROTATION', 'LIMIT_LOCATION', 'LIMIT_SCALE',
+                     'TRANSFORMATION', 'IK', etc.
+
+    Example:
+        add_bone_constraint(rig, "eye.L", "TRACK_TO",
+                            target_obj=look_at_target,
+                            track_axis='TRACK_NEGATIVE_Z',
+                            up_axis='UP_Y')
+    """
+    import bpy
+    bpy.context.view_layer.objects.active = armature_obj
+    bpy.ops.object.mode_set(mode='POSE')
+    try:
+        pose_bone = armature_obj.pose.bones.get(bone_name)
+        if not pose_bone:
+            return {"error": f"pose bone '{bone_name}' not found"}
+        con = pose_bone.constraints.new(constraint_type)
+        if target_obj:
+            con.target = target_obj
+        for k, v in kwargs.items():
+            if hasattr(con, k):
+                setattr(con, k, v)
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+    return {"armature": armature_obj.name, "bone": bone_name,
+            "constraint": constraint_type}
+
+
+def get_bones(armature_obj):
+    """List all bones in an armature with their head/tail positions.
+
+    Example: bones = get_bones(rig)
+    """
+    result = []
+    for bone in armature_obj.data.bones:
+        result.append({
+            "name": bone.name,
+            "head": [round(v, 4) for v in bone.head_local],
+            "tail": [round(v, 4) for v in bone.tail_local],
+            "parent": bone.parent.name if bone.parent else None,
+            "connected": bone.use_connect,
+            "length": round(bone.length, 4),
+        })
+    return result
+
+
+def pose_bone(armature_obj, bone_name, location=None,
+              rotation_euler=None, scale=None):
+    """Set a pose bone's transform (in pose mode coords).
+
+    rotation_euler: (rx, ry, rz) in degrees.
+
+    Example: pose_bone(rig, "upper_arm.L", rotation_euler=(0, 0, -45))
+    """
+    import bpy
+    import math
+    bpy.context.view_layer.objects.active = armature_obj
+    bpy.ops.object.mode_set(mode='POSE')
+    try:
+        pb = armature_obj.pose.bones.get(bone_name)
+        if not pb:
+            return {"error": f"pose bone '{bone_name}' not found"}
+        if location:
+            pb.location = location
+        if rotation_euler:
+            pb.rotation_mode = 'XYZ'
+            pb.rotation_euler = tuple(math.radians(r) for r in rotation_euler)
+        if scale:
+            pb.scale = scale
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+    return {"armature": armature_obj.name, "bone": bone_name}
+
+
+def keyframe_bone(armature_obj, bone_name, data_path='rotation_euler',
+                  frame=None):
+    """Insert a keyframe on a pose bone property.
+
+    data_path: 'location', 'rotation_euler', 'rotation_quaternion', 'scale'.
+
+    Example:
+        pose_bone(rig, "upper_arm.L", rotation_euler=(0, 0, -45))
+        keyframe_bone(rig, "upper_arm.L", 'rotation_euler', frame=1)
+        pose_bone(rig, "upper_arm.L", rotation_euler=(0, 0, 0))
+        keyframe_bone(rig, "upper_arm.L", 'rotation_euler', frame=30)
+    """
+    import bpy
+    f = frame or bpy.context.scene.frame_current
+    bpy.context.view_layer.objects.active = armature_obj
+    bpy.ops.object.mode_set(mode='POSE')
+    try:
+        pb = armature_obj.pose.bones.get(bone_name)
+        if not pb:
+            return {"error": f"pose bone '{bone_name}' not found"}
+        pb.keyframe_insert(data_path=data_path, frame=f)
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+    return {"armature": armature_obj.name, "bone": bone_name,
+            "data_path": data_path, "frame": f}
+
+
+def mirror_bones(armature_obj, suffix_from='.L', suffix_to='.R'):
+    """Mirror all bones from one side to the other (e.g. .L → .R).
+
+    Example: mirror_bones(rig)  # mirrors all .L bones to .R
+    """
+    import bpy
+    bpy.context.view_layer.objects.active = armature_obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    created = []
+    try:
+        bpy.ops.armature.select_all(action='DESELECT')
+        for bone in armature_obj.data.edit_bones:
+            if bone.name.endswith(suffix_from):
+                bone.select = True
+                bone.select_head = True
+                bone.select_tail = True
+        bpy.ops.armature.symmetrize()
+        for bone in armature_obj.data.edit_bones:
+            if bone.name.endswith(suffix_to):
+                created.append(bone.name)
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+    return {"armature": armature_obj.name, "mirrored": created}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SHAPE KEYS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def add_shape_key(obj, name="Key", from_mix=False):
+    """Add a shape key to a mesh object.
+
+    The first call creates the 'Basis' key automatically.
+    After adding, edit vertices to define the shape, then set value to blend.
+
+    Example:
+        add_shape_key(face, "Basis")     # reference shape
+        add_shape_key(face, "Smile")     # now edit verts for smile pose
+    """
+    if not obj.data.shape_keys:
+        obj.shape_key_add(name="Basis", from_mix=False)
+    sk = obj.shape_key_add(name=name, from_mix=from_mix)
+    return {"object": obj.name, "shape_key": sk.name,
+            "index": len(obj.data.shape_keys.key_blocks) - 1}
+
+
+def set_shape_key_value(obj, name, value=1.0):
+    """Set a shape key's influence value (0.0 to 1.0).
+
+    Example: set_shape_key_value(face, "Smile", 0.7)
+    """
+    sk = obj.data.shape_keys
+    if not sk:
+        return {"error": "no shape keys on object"}
+    key = sk.key_blocks.get(name)
+    if not key:
+        return {"error": f"shape key '{name}' not found"}
+    key.value = value
+    return {"object": obj.name, "shape_key": name, "value": value}
+
+
+def edit_shape_key(obj, name, vertex_offsets):
+    """Edit shape key vertex positions by offsets from basis.
+
+    vertex_offsets: dict of {vertex_index: (dx, dy, dz)} or
+                   list of (vertex_index, (dx, dy, dz)) tuples.
+
+    Example:
+        add_shape_key(face, "Smile")
+        edit_shape_key(face, "Smile", {
+            10: (0, 0, 0.1),   # lift corner of mouth
+            11: (0, 0, 0.1),
+            20: (0, 0, -0.05), # lower chin slightly
+        })
+    """
+    from mathutils import Vector
+    sk = obj.data.shape_keys
+    if not sk:
+        return {"error": "no shape keys"}
+    key = sk.key_blocks.get(name)
+    basis = sk.key_blocks.get("Basis")
+    if not key or not basis:
+        return {"error": f"shape key '{name}' or Basis not found"}
+    if isinstance(vertex_offsets, dict):
+        vertex_offsets = list(vertex_offsets.items())
+    for vi, offset in vertex_offsets:
+        if vi < len(key.data):
+            base_co = basis.data[vi].co
+            key.data[vi].co = base_co + Vector(offset)
+    return {"object": obj.name, "shape_key": name,
+            "vertices_edited": len(vertex_offsets)}
+
+
+def animate_shape_key(obj, name, keyframes):
+    """Animate a shape key value over time.
+
+    keyframes: list of (frame, value) tuples.
+
+    Example:
+        animate_shape_key(face, "Smile", [(1, 0), (15, 1.0), (30, 0)])
+    """
+    sk = obj.data.shape_keys
+    if not sk:
+        return {"error": "no shape keys"}
+    key = sk.key_blocks.get(name)
+    if not key:
+        return {"error": f"shape key '{name}' not found"}
+    for frame, value in keyframes:
+        key.value = value
+        key.keyframe_insert(data_path='value', frame=frame)
+    return {"object": obj.name, "shape_key": name,
+            "keyframes": len(keyframes)}
+
+
+def get_shape_keys(obj):
+    """List all shape keys on an object.
+
+    Example: keys = get_shape_keys(face)
+    """
+    sk = obj.data.shape_keys
+    if not sk:
+        return []
+    return [{"name": kb.name, "value": round(kb.value, 3),
+             "mute": kb.mute}
+            for kb in sk.key_blocks]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DRIVERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def add_driver(obj, driven_path, driver_obj, driver_path,
+               expression=None, index=-1):
+    """Add a driver to a property — one property controls another.
+
+    driven_path: property being driven (e.g. 'location', 'scale').
+    driver_obj: object providing the driving value.
+    driver_path: property on driver_obj to read from.
+    expression: optional math expression using 'var' (e.g. 'var * 2').
+    index: channel index (-1 = all, 0=X, 1=Y, 2=Z).
+
+    Example:
+        # Make cube's Z scale follow empty's Z location
+        add_driver(cube, 'scale', empty, 'location',
+                   expression='var * 0.5', index=2)
+    """
+    if index >= 0:
+        fc = obj.driver_add(driven_path, index)
+    else:
+        result = obj.driver_add(driven_path)
+        fc = result if not isinstance(result, list) else result[0]
+    driver = fc.driver
+    if expression:
+        driver.type = 'SCRIPTED'
+        driver.expression = expression
+    else:
+        driver.type = 'AVERAGE'
+    var = driver.variables.new()
+    var.name = 'var'
+    var.targets[0].id = driver_obj
+    var.targets[0].data_path = driver_path if '.' in driver_path else driver_path
+    return {"object": obj.name, "driven": driven_path,
+            "driver_source": driver_obj.name}
+
+
+def add_expression_driver(obj, data_path, expression, variables=None,
+                          index=-1):
+    """Add a scripted expression driver with multiple variables.
+
+    variables: dict of {var_name: (object, data_path)} pairs.
+
+    Example:
+        add_expression_driver(cube, 'location', 'x + y * 0.5',
+            variables={'x': (empty1, 'location.x'),
+                       'y': (empty2, 'location.z')}, index=2)
+    """
+    if index >= 0:
+        fc = obj.driver_add(data_path, index)
+    else:
+        result = obj.driver_add(data_path)
+        fc = result if not isinstance(result, list) else result[0]
+    driver = fc.driver
+    driver.type = 'SCRIPTED'
+    driver.expression = expression
+    if variables:
+        for vname, (vobj, vpath) in variables.items():
+            var = driver.variables.new()
+            var.name = vname
+            var.targets[0].id = vobj
+            var.targets[0].data_path = vpath
+    return {"object": obj.name, "data_path": data_path,
+            "expression": expression}
+
+
+def remove_driver(obj, data_path, index=-1):
+    """Remove a driver from a property.
+
+    Example: remove_driver(cube, 'scale', index=2)
+    """
+    if index >= 0:
+        obj.driver_remove(data_path, index)
+    else:
+        obj.driver_remove(data_path)
+    return {"object": obj.name, "data_path": data_path, "removed": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OBJECT CONSTRAINTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def add_constraint(obj, constraint_type, target=None, **kwargs):
+    """Add a constraint to an object.
+
+    constraint_type: 'COPY_LOCATION', 'COPY_ROTATION', 'COPY_SCALE',
+                     'TRACK_TO', 'DAMPED_TRACK', 'LIMIT_LOCATION',
+                     'LIMIT_ROTATION', 'LIMIT_SCALE', 'FLOOR',
+                     'CHILD_OF', 'FOLLOW_PATH', 'CLAMP_TO',
+                     'LOCKED_TRACK', 'STRETCH_TO', 'MAINTAIN_VOLUME',
+                     'TRANSFORM', 'SHRINKWRAP'.
+    target: target object (optional, depends on constraint type).
+    **kwargs: any additional constraint properties.
+
+    Example:
+        add_constraint(eye, 'TRACK_TO', target=look_target,
+                       track_axis='TRACK_NEGATIVE_Z', up_axis='UP_Y')
+    """
+    con = obj.constraints.new(type=constraint_type)
+    if target:
+        con.target = target
+    for k, v in kwargs.items():
+        if hasattr(con, k):
+            setattr(con, k, v)
+    return {"object": obj.name, "constraint": con.name,
+            "type": constraint_type}
+
+
+def remove_constraint(obj, constraint_name=None, constraint_type=None):
+    """Remove a constraint by name or type.
+
+    Example: remove_constraint(cube, constraint_name="Track To")
+             remove_constraint(cube, constraint_type='TRACK_TO')
+    """
+    to_remove = []
+    for con in obj.constraints:
+        if constraint_name and con.name == constraint_name:
+            to_remove.append(con)
+        elif constraint_type and con.type == constraint_type:
+            to_remove.append(con)
+    for con in to_remove:
+        obj.constraints.remove(con)
+    return {"object": obj.name, "removed": len(to_remove)}
+
+
+def add_copy_location(obj, target, influence=1.0, use_x=True,
+                      use_y=True, use_z=True):
+    """Shortcut: add Copy Location constraint.
+
+    Example: add_copy_location(follower, leader, use_z=False)
+    """
+    con = obj.constraints.new(type='COPY_LOCATION')
+    con.target = target
+    con.influence = influence
+    con.use_x = use_x
+    con.use_y = use_y
+    con.use_z = use_z
+    return {"object": obj.name, "constraint": con.name}
+
+
+def add_copy_rotation(obj, target, influence=1.0, use_x=True,
+                      use_y=True, use_z=True):
+    """Shortcut: add Copy Rotation constraint.
+
+    Example: add_copy_rotation(turret, controller)
+    """
+    con = obj.constraints.new(type='COPY_ROTATION')
+    con.target = target
+    con.influence = influence
+    con.use_x = use_x
+    con.use_y = use_y
+    con.use_z = use_z
+    return {"object": obj.name, "constraint": con.name}
+
+
+def add_track_to(obj, target, track_axis='TRACK_NEGATIVE_Z',
+                 up_axis='UP_Y'):
+    """Shortcut: add Track To constraint (object always looks at target).
+
+    Example: add_track_to(camera, focus_point)
+    """
+    con = obj.constraints.new(type='TRACK_TO')
+    con.target = target
+    con.track_axis = track_axis
+    con.up_axis = up_axis
+    return {"object": obj.name, "constraint": con.name}
+
+
+def add_floor_constraint(obj, target, offset=0, use_rotation=False):
+    """Shortcut: add Floor constraint (object can't go below target).
+
+    Example: add_floor_constraint(ball, ground_plane)
+    """
+    con = obj.constraints.new(type='FLOOR')
+    con.target = target
+    con.offset = offset
+    con.use_rotation = use_rotation
+    return {"object": obj.name, "constraint": con.name}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PARTICLE SYSTEMS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def add_particle_emitter(obj, name="Particles", count=1000, lifetime=50,
+                         frame_start=1, frame_end=200, velocity=(0, 0, 1),
+                         gravity=1.0, size=0.05):
+    """Add an emitter particle system to an object.
+
+    Example:
+        add_particle_emitter(fountain, count=500, lifetime=30,
+                             velocity=(0, 0, 5), size=0.02)
+    """
+    mod = obj.modifiers.new(name=name, type='PARTICLE_SYSTEM')
+    ps = mod.particle_system.settings
+    ps.count = count
+    ps.lifetime = lifetime
+    ps.frame_start = frame_start
+    ps.frame_end = frame_end
+    ps.normal_factor = velocity[2] if len(velocity) > 2 else 1.0
+    ps.factor_random = 0.2
+    ps.particle_size = size
+    ps.effector_weights.gravity = gravity
+    return {"object": obj.name, "particle_system": name, "count": count}
+
+
+def add_hair_system(obj, name="Hair", count=500, length=0.5,
+                    segments=5, seed=0):
+    """Add a hair particle system to an object.
+
+    Example:
+        add_hair_system(head, count=2000, length=0.3, segments=6)
+    """
+    mod = obj.modifiers.new(name=name, type='PARTICLE_SYSTEM')
+    ps = mod.particle_system.settings
+    ps.type = 'HAIR'
+    ps.count = count
+    ps.hair_length = length
+    ps.hair_step = segments
+    ps.child_type = 'INTERPOLATED'
+    ps.child_nbr = 10
+    ps.rendered_child_count = 50
+    if seed:
+        ps.seed = seed
+    return {"object": obj.name, "particle_system": name, "count": count}
+
+
+def set_particle_instance(particle_obj, instance_obj, use_rotation=True,
+                          use_scale=True, scale_random=0.1):
+    """Set an object to be instanced on each particle.
+
+    Example:
+        leaf = create_sphere("Leaf", radius=0.02)
+        add_particle_emitter(tree, count=200)
+        set_particle_instance(tree, leaf)
+    """
+    for mod in particle_obj.modifiers:
+        if mod.type == 'PARTICLE_SYSTEM':
+            ps = mod.particle_system.settings
+            ps.render_type = 'OBJECT'
+            ps.instance_object = instance_obj
+            ps.use_rotation_instance = use_rotation
+            ps.use_scale_instance = use_scale
+            ps.size_random = scale_random
+            return {"particle_obj": particle_obj.name,
+                    "instance": instance_obj.name}
+    return {"error": "no particle system found on object"}
+
+
+def remove_particles(obj, name=None):
+    """Remove particle system(s) from an object.
+
+    name: specific system name, or None to remove all.
+
+    Example: remove_particles(obj)
+    """
+    to_remove = []
+    for mod in obj.modifiers:
+        if mod.type == 'PARTICLE_SYSTEM':
+            if name is None or mod.name == name:
+                to_remove.append(mod.name)
+    for mname in to_remove:
+        obj.modifiers.remove(obj.modifiers[mname])
+    return {"object": obj.name, "removed": len(to_remove)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHYSICS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def add_rigid_body(obj, body_type='ACTIVE', mass=1.0, friction=0.5,
+                   bounciness=0.5, collision_shape='CONVEX_HULL'):
+    """Add rigid body physics to an object.
+
+    body_type: 'ACTIVE' (falls/collides) or 'PASSIVE' (static obstacle).
+    collision_shape: 'BOX', 'SPHERE', 'CAPSULE', 'CYLINDER',
+                     'CONE', 'CONVEX_HULL', 'MESH'.
+
+    Example:
+        add_rigid_body(ball, 'ACTIVE', mass=2.0, bounciness=0.8)
+        add_rigid_body(floor, 'PASSIVE')
+    """
+    import bpy
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.rigidbody.object_add()
+    rb = obj.rigid_body
+    rb.type = body_type
+    rb.mass = mass
+    rb.friction = friction
+    rb.restitution = bounciness
+    rb.collision_shape = collision_shape
+    return {"object": obj.name, "type": body_type, "mass": mass}
+
+
+def add_cloth(obj, quality=5, mass=0.3, stiffness=15.0,
+              damping=5.0, gravity=True):
+    """Add cloth simulation to a mesh.
+
+    Example: add_cloth(curtain, stiffness=5.0, damping=10.0)
+    """
+    mod = obj.modifiers.new(name="Cloth", type='CLOTH')
+    cs = mod.settings
+    cs.quality = quality
+    cs.mass = mass
+    cs.tension_stiffness = stiffness
+    cs.tension_damping = damping
+    cs.effector_weights.gravity = 1.0 if gravity else 0.0
+    return {"object": obj.name, "modifier": "Cloth"}
+
+
+def add_collision(obj, thickness_outer=0.02, thickness_inner=0.01,
+                  damping=0.0, friction=0.0):
+    """Make an object a collision surface for cloth/softbody/particles.
+
+    Example:
+        add_collision(ground)    # particles and cloth bounce off ground
+    """
+    mod = obj.modifiers.new(name="Collision", type='COLLISION')
+    cs = mod.settings
+    cs.thickness_outer = thickness_outer
+    cs.thickness_inner = thickness_inner
+    cs.damping = damping
+    cs.cloth_friction = friction
+    return {"object": obj.name, "modifier": "Collision"}
+
+
+def add_soft_body(obj, mass=1.0, friction=0.5, speed=1.0,
+                  goal_strength=0.7):
+    """Add soft body simulation to a mesh.
+
+    Example: add_soft_body(jelly, mass=0.5, goal_strength=0.3)
+    """
+    mod = obj.modifiers.new(name="Softbody", type='SOFT_BODY')
+    sb = mod.settings
+    sb.mass = mass
+    sb.friction = friction
+    sb.speed = speed
+    sb.goal_spring = goal_strength
+    return {"object": obj.name, "modifier": "Softbody"}
+
+
+def add_force_field(obj=None, field_type='FORCE', strength=1.0,
+                    location=(0, 0, 0)):
+    """Add a force field (wind, vortex, turbulence, etc.).
+
+    field_type: 'FORCE', 'WIND', 'VORTEX', 'MAGNETIC', 'HARMONIC',
+                'CHARGE', 'LENNARDJ', 'TEXTURE', 'GUIDE', 'BOID',
+                'TURBULENCE', 'DRAG', 'FLUID_FLOW'.
+
+    Example:
+        add_force_field(field_type='WIND', strength=5.0, location=(0,0,0))
+        add_force_field(field_type='TURBULENCE', strength=2.0)
+    """
+    import bpy
+    if obj is None:
+        bpy.ops.object.empty_add(location=location)
+        obj = bpy.context.active_object
+        obj.name = f"Force_{field_type}"
+    obj.field.type = field_type
+    obj.field.strength = strength
+    return {"object": obj.name, "field_type": field_type,
+            "strength": strength}
+
+
+def set_gravity(x=0, y=0, z=-9.81):
+    """Set scene gravity.
+
+    Example: set_gravity(0, 0, -1.62)  # Moon gravity
+    """
+    import bpy
+    bpy.context.scene.gravity = (x, y, z)
+    return {"gravity": (x, y, z)}
+
+
+def bake_physics(frame_start=1, frame_end=250):
+    """Bake all physics simulations in the scene.
+
+    Example: bake_physics(1, 120)
+    """
+    import bpy
+    bpy.context.scene.frame_start = frame_start
+    bpy.context.scene.frame_end = frame_end
+    bpy.ops.ptcache.bake_all(bake=True)
+    return {"status": "baked", "frames": f"{frame_start}-{frame_end}"}
+
+
+def free_physics_bake():
+    """Free all baked physics caches (allows re-simulation).
+
+    Example: free_physics_bake()
+    """
+    import bpy
+    bpy.ops.ptcache.free_bake_all()
+    return {"status": "freed"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RENDERING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def set_render_engine(engine='CYCLES'):
+    """Set render engine.
+
+    engine: 'CYCLES', 'BLENDER_EEVEE_NEXT' (4.0+), 'BLENDER_EEVEE' (<4.0),
+            'BLENDER_WORKBENCH'.
+
+    Example: set_render_engine('CYCLES')
+    """
+    import bpy
+    bpy.context.scene.render.engine = engine
+    return {"engine": engine}
+
+
+def set_render_resolution(x=1920, y=1080, percentage=100):
+    """Set render output resolution.
+
+    Example: set_render_resolution(3840, 2160)  # 4K
+    """
+    import bpy
+    bpy.context.scene.render.resolution_x = x
+    bpy.context.scene.render.resolution_y = y
+    bpy.context.scene.render.resolution_percentage = percentage
+    return {"resolution": f"{x}x{y}", "percentage": percentage}
+
+
+def set_render_samples(samples=128, denoise=True):
+    """Set render samples (for Cycles or EEVEE).
+
+    Example: set_render_samples(256, denoise=True)
+    """
+    import bpy
+    engine = bpy.context.scene.render.engine
+    if engine == 'CYCLES':
+        bpy.context.scene.cycles.samples = samples
+        bpy.context.scene.cycles.use_denoising = denoise
+    else:
+        bpy.context.scene.eevee.taa_render_samples = samples
+    return {"samples": samples, "denoise": denoise, "engine": engine}
+
+
+def set_output_path(path="//render/", file_format='PNG'):
+    """Set render output path and file format.
+
+    file_format: 'PNG', 'JPEG', 'OPEN_EXR', 'TIFF', 'BMP',
+                 'FFMPEG' (for animations).
+
+    Example: set_output_path("//output/scene_", file_format='PNG')
+    """
+    import bpy
+    bpy.context.scene.render.filepath = path
+    bpy.context.scene.render.image_settings.file_format = file_format
+    return {"path": path, "format": file_format}
+
+
+def render_image(filepath=None):
+    """Render the current frame to an image file.
+
+    filepath: output path. None = uses scene output settings.
+
+    Example: render_image("//render/preview.png")
+    """
+    import bpy
+    if filepath:
+        bpy.context.scene.render.filepath = filepath
+    bpy.ops.render.render(write_still=True)
+    return {"filepath": bpy.context.scene.render.filepath,
+            "status": "rendered"}
+
+
+def render_animation(filepath=None):
+    """Render the full animation.
+
+    Example: render_animation("//render/anim_")
+    """
+    import bpy
+    if filepath:
+        bpy.context.scene.render.filepath = filepath
+    bpy.ops.render.render(animation=True)
+    return {"filepath": bpy.context.scene.render.filepath,
+            "status": "animation rendered"}
+
+
+def set_transparent_background(transparent=True):
+    """Enable transparent (alpha) background for renders.
+
+    Example: set_transparent_background(True)
+    """
+    import bpy
+    bpy.context.scene.render.film_transparent = transparent
+    if bpy.context.scene.render.image_settings.file_format == 'PNG':
+        bpy.context.scene.render.image_settings.color_mode = 'RGBA'
+    return {"transparent": transparent}
+
+
+def set_color_management(view_transform='Filmic', look='None',
+                         exposure=0, gamma=1.0):
+    """Set color management settings for rendering.
+
+    view_transform: 'Standard', 'Filmic', 'AgX' (4.0+), 'Raw'.
+    look: 'None', 'High Contrast', 'Medium High Contrast', etc.
+
+    Example: set_color_management('AgX', look='High Contrast')
+    """
+    import bpy
+    cm = bpy.context.scene.view_settings
+    cm.view_transform = view_transform
+    cm.look = look
+    cm.exposure = exposure
+    cm.gamma = gamma
+    return {"view_transform": view_transform, "look": look}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ADVANCED MATERIALS & TEXTURES
+# ═══════════════════════════════════════════════════════════════════════════
+
+def image_texture_material(name="ImageMat", image_path=None,
+                           roughness=0.5, metallic=0.0):
+    """Create a material with an image texture.
+
+    Example:
+        mat = image_texture_material("BrickWall", "//textures/brick.jpg")
+        assign_material(wall, mat)
+    """
+    import bpy
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+    output = nodes.new('ShaderNodeOutputMaterial')
+    output.location = (400, 0)
+    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+    bsdf.location = (0, 0)
+    bsdf.inputs['Roughness'].default_value = roughness
+    bsdf.inputs['Metallic'].default_value = metallic
+    links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+    if image_path:
+        tex = nodes.new('ShaderNodeTexImage')
+        tex.location = (-400, 0)
+        try:
+            img = bpy.data.images.load(image_path)
+            tex.image = img
+        except Exception:
+            pass
+        links.new(tex.outputs['Color'], bsdf.inputs['Base Color'])
+        coord = nodes.new('ShaderNodeTexCoord')
+        coord.location = (-800, 0)
+        mapping = nodes.new('ShaderNodeMapping')
+        mapping.location = (-600, 0)
+        links.new(coord.outputs['UV'], mapping.inputs['Vector'])
+        links.new(mapping.outputs['Vector'], tex.inputs['Vector'])
+    return mat
+
+
+def gradient_material(name="Gradient", color1=(0.1, 0.1, 0.8),
+                      color2=(0.8, 0.1, 0.1), gradient_type='LINEAR',
+                      axis='Z'):
+    """Create a gradient material blending between two colors.
+
+    gradient_type: 'LINEAR', 'QUADRATIC', 'EASING', 'DIAGONAL',
+                   'SPHERICAL', 'QUADRATIC_SPHERE', 'RADIAL'.
+
+    Example:
+        mat = gradient_material("SunsetSky", (0.1,0.1,0.5), (1,0.5,0.1))
+        assign_material(backdrop, mat)
+    """
+    import bpy
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+    output = nodes.new('ShaderNodeOutputMaterial')
+    output.location = (600, 0)
+    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+    bsdf.location = (300, 0)
+    links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+    mix = nodes.new('ShaderNodeMix')
+    mix.data_type = 'RGBA'
+    mix.location = (0, 0)
+    mix.inputs[6].default_value = (*color1, 1)
+    mix.inputs[7].default_value = (*color2, 1)
+    links.new(mix.outputs[2], bsdf.inputs['Base Color'])
+    grad = nodes.new('ShaderNodeTexGradient')
+    grad.gradient_type = gradient_type
+    grad.location = (-400, 0)
+    links.new(grad.outputs['Fac'], mix.inputs['Factor'])
+    coord = nodes.new('ShaderNodeTexCoord')
+    coord.location = (-800, 0)
+    mapping = nodes.new('ShaderNodeMapping')
+    mapping.location = (-600, 0)
+    if axis == 'Z':
+        mapping.inputs['Rotation'].default_value = (1.5708, 0, 0)
+    elif axis == 'X':
+        mapping.inputs['Rotation'].default_value = (0, 0, 1.5708)
+    links.new(coord.outputs['Object'], mapping.inputs['Vector'])
+    links.new(mapping.outputs['Vector'], grad.inputs['Vector'])
+    return mat
+
+
+def subsurface_material(name="Skin", color=(0.8, 0.5, 0.4),
+                        subsurface=0.3, subsurface_color=(0.7, 0.2, 0.1),
+                        roughness=0.4):
+    """Create a subsurface scattering material (skin, wax, marble, etc.).
+
+    Example:
+        mat = subsurface_material("HumanSkin", color=(0.8, 0.6, 0.5))
+        assign_material(character, mat)
+    """
+    import bpy
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    if not bsdf:
+        bsdf = mat.node_tree.nodes.new('ShaderNodeBsdfPrincipled')
+    bsdf.inputs['Base Color'].default_value = (*color, 1)
+    bsdf.inputs['Subsurface Weight'].default_value = subsurface
+    bsdf.inputs['Subsurface Color'].default_value = (*subsurface_color, 1)
+    bsdf.inputs['Roughness'].default_value = roughness
+    return mat
+
+
+def add_normal_map(mat, image_path=None, strength=1.0):
+    """Add a normal map to an existing material.
+
+    Example:
+        mat = quick_material("BrickWall", color=(0.5, 0.3, 0.2))
+        add_normal_map(mat, "//textures/brick_normal.jpg", strength=1.5)
+    """
+    import bpy
+    if not mat.use_nodes:
+        mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    bsdf = None
+    for node in nodes:
+        if node.type == 'BSDF_PRINCIPLED':
+            bsdf = node
+            break
+    if not bsdf:
+        return {"error": "no Principled BSDF found"}
+    normal_map = nodes.new('ShaderNodeNormalMap')
+    normal_map.inputs['Strength'].default_value = strength
+    normal_map.location = (bsdf.location.x - 300, bsdf.location.y - 300)
+    links.new(normal_map.outputs['Normal'], bsdf.inputs['Normal'])
+    if image_path:
+        tex = nodes.new('ShaderNodeTexImage')
+        tex.location = (normal_map.location.x - 300,
+                        normal_map.location.y)
+        try:
+            img = bpy.data.images.load(image_path)
+            img.colorspace_settings.name = 'Non-Color'
+            tex.image = img
+        except Exception:
+            pass
+        links.new(tex.outputs['Color'], normal_map.inputs['Color'])
+    return {"material": mat.name, "normal_map": True}
+
+
+def add_displacement(mat, strength=0.1, midlevel=0.5, image_path=None):
+    """Add displacement mapping to a material.
+
+    Example:
+        add_displacement(terrain_mat, strength=0.5)
+    """
+    import bpy
+    if not mat.use_nodes:
+        mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    output = None
+    for node in nodes:
+        if node.type == 'OUTPUT_MATERIAL':
+            output = node
+            break
+    if not output:
+        return {"error": "no material output found"}
+    disp = nodes.new('ShaderNodeDisplacement')
+    disp.inputs['Scale'].default_value = strength
+    disp.inputs['Midlevel'].default_value = midlevel
+    disp.location = (output.location.x - 200, output.location.y - 200)
+    links.new(disp.outputs['Displacement'], output.inputs['Displacement'])
+    if image_path:
+        tex = nodes.new('ShaderNodeTexImage')
+        tex.location = (disp.location.x - 300, disp.location.y)
+        try:
+            img = bpy.data.images.load(image_path)
+            img.colorspace_settings.name = 'Non-Color'
+            tex.image = img
+        except Exception:
+            pass
+        links.new(tex.outputs['Color'], disp.inputs['Height'])
+    else:
+        noise = nodes.new('ShaderNodeTexNoise')
+        noise.location = (disp.location.x - 300, disp.location.y)
+        links.new(noise.outputs['Fac'], disp.inputs['Height'])
+    return {"material": mat.name, "displacement": True}
+
+
+def mix_shader(mat, shader1_type='BSDF_PRINCIPLED',
+               shader2_type='BSDF_PRINCIPLED', factor=0.5):
+    """Create a material that mixes two shaders.
+
+    Example: mat = mix_shader(mat, factor=0.5)
+    """
+    if not mat.use_nodes:
+        mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    output = None
+    for node in nodes:
+        if node.type == 'OUTPUT_MATERIAL':
+            output = node
+            break
+    mix = nodes.new('ShaderNodeMixShader')
+    mix.location = (output.location.x - 200, output.location.y)
+    mix.inputs['Fac'].default_value = factor
+    shader2 = nodes.new(f'ShaderNode{shader2_type.replace("BSDF_", "Bsdf")}' if 'BSDF' in shader2_type else f'ShaderNode{shader2_type}')
+    shader2.location = (mix.location.x - 300, mix.location.y - 200)
+    existing_shader = None
+    for link in links:
+        if link.to_node == output and link.to_socket.name == 'Surface':
+            existing_shader = link.from_node
+            links.remove(link)
+            break
+    if existing_shader:
+        links.new(existing_shader.outputs[0], mix.inputs[1])
+    links.new(shader2.outputs[0], mix.inputs[2])
+    links.new(mix.outputs[0], output.inputs['Surface'])
+    return mat
+
+
+def environment_texture(image_path, strength=1.0):
+    """Set an HDRI environment texture for world lighting.
+
+    Example: environment_texture("//hdri/studio_small.exr")
+    """
+    import bpy
+    world = bpy.context.scene.world
+    if not world:
+        world = bpy.data.worlds.new("World")
+        bpy.context.scene.world = world
+    world.use_nodes = True
+    nodes = world.node_tree.nodes
+    links = world.node_tree.links
+    nodes.clear()
+    output = nodes.new('ShaderNodeOutputWorld')
+    output.location = (400, 0)
+    bg = nodes.new('ShaderNodeBackground')
+    bg.location = (0, 0)
+    bg.inputs['Strength'].default_value = strength
+    links.new(bg.outputs['Background'], output.inputs['Surface'])
+    env_tex = nodes.new('ShaderNodeTexEnvironment')
+    env_tex.location = (-400, 0)
+    try:
+        img = bpy.data.images.load(image_path)
+        env_tex.image = img
+    except Exception:
+        pass
+    links.new(env_tex.outputs['Color'], bg.inputs['Color'])
+    coord = nodes.new('ShaderNodeTexCoord')
+    coord.location = (-700, 0)
+    links.new(coord.outputs['Generated'], env_tex.inputs['Vector'])
+    return {"world": world.name, "image": image_path}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WEIGHT PAINTING & VERTEX GROUPS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def set_vertex_weights(obj, group_name, vertex_indices, weight=1.0):
+    """Set vertex weights for a vertex group.
+
+    Example:
+        create_vertex_group(mesh, "Head")
+        head_verts = find_verts_in_range(mesh, 'Z', 1.5, 2.0)
+        set_vertex_weights(mesh, "Head", head_verts, weight=1.0)
+    """
+    vg = obj.vertex_groups.get(group_name)
+    if not vg:
+        vg = obj.vertex_groups.new(name=group_name)
+    vg.add(list(vertex_indices), weight, 'REPLACE')
+    return {"object": obj.name, "group": group_name,
+            "vertices": len(vertex_indices), "weight": weight}
+
+
+def paint_weight_gradient(obj, group_name, axis='Z', min_weight=0.0,
+                          max_weight=1.0):
+    """Paint a linear weight gradient along an axis.
+
+    Vertices at the minimum of the axis get min_weight, at maximum
+    get max_weight. Useful for falloff effects.
+
+    Example:
+        paint_weight_gradient(curtain, "Pin", axis='Z',
+                              min_weight=0.0, max_weight=1.0)
+    """
+    vg = obj.vertex_groups.get(group_name)
+    if not vg:
+        vg = obj.vertex_groups.new(name=group_name)
+    axis_idx = {'X': 0, 'Y': 1, 'Z': 2}[axis.upper()]
+    verts = obj.data.vertices
+    if not verts:
+        return {"error": "no vertices"}
+    coords = [v.co[axis_idx] for v in verts]
+    min_c, max_c = min(coords), max(coords)
+    span = max_c - min_c
+    if span < 1e-6:
+        span = 1.0
+    for v in verts:
+        t = (v.co[axis_idx] - min_c) / span
+        w = min_weight + t * (max_weight - min_weight)
+        vg.add([v.index], w, 'REPLACE')
+    return {"object": obj.name, "group": group_name, "axis": axis,
+            "vertices": len(verts)}
+
+
+def normalize_weights(obj):
+    """Normalize all vertex group weights on an object.
+
+    Example: normalize_weights(character)
+    """
+    import bpy
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode='WEIGHT_PAINT')
+    try:
+        bpy.ops.object.vertex_group_normalize_all()
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+    return {"object": obj.name, "status": "normalized"}
+
+
+def get_vertex_weights(obj, group_name, vertex_indices=None):
+    """Get vertex weights for a vertex group.
+
+    Example: weights = get_vertex_weights(mesh, "Head")
+    """
+    vg = obj.vertex_groups.get(group_name)
+    if not vg:
+        return {"error": f"group '{group_name}' not found"}
+    if vertex_indices is None:
+        vertex_indices = range(len(obj.data.vertices))
+    result = {}
+    for vi in vertex_indices:
+        try:
+            w = vg.weight(vi)
+            result[vi] = round(w, 4)
+        except RuntimeError:
+            pass
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMPOSITOR
+# ═══════════════════════════════════════════════════════════════════════════
+
+def setup_compositor(use_nodes=True):
+    """Enable the compositor and set up basic nodes.
+
+    Example: setup_compositor()
+    """
+    import bpy
+    bpy.context.scene.use_nodes = use_nodes
+    tree = bpy.context.scene.node_tree
+    if not tree.nodes:
+        rl = tree.nodes.new('CompositorNodeRLayers')
+        rl.location = (0, 0)
+        comp = tree.nodes.new('CompositorNodeComposite')
+        comp.location = (600, 0)
+        tree.links.new(rl.outputs['Image'], comp.inputs['Image'])
+    return {"compositor": "enabled"}
+
+
+def add_glare(glare_type='FOG_GLOW', threshold=1.0, size=6,
+              strength=1.0):
+    """Add a glare/bloom effect in the compositor.
+
+    glare_type: 'BLOOM' (4.0+), 'FOG_GLOW', 'STREAKS', 'SIMPLE_STAR', 'GHOSTS'.
+
+    Example: add_glare(glare_type='FOG_GLOW', threshold=0.8, size=8)
+    """
+    import bpy
+    bpy.context.scene.use_nodes = True
+    tree = bpy.context.scene.node_tree
+    glare = tree.nodes.new('CompositorNodeGlare')
+    glare.glare_type = glare_type
+    glare.threshold = threshold
+    glare.size = size
+    glare.mix = strength - 1.0
+    rl = None
+    comp = None
+    for node in tree.nodes:
+        if node.type == 'R_LAYERS':
+            rl = node
+        elif node.type == 'COMPOSITE':
+            comp = node
+    if rl and comp:
+        for link in list(tree.links):
+            if (link.from_node == rl and link.to_node == comp
+                    and link.from_socket.name == 'Image'):
+                tree.links.remove(link)
+        glare.location = (rl.location.x + 300, rl.location.y)
+        tree.links.new(rl.outputs['Image'], glare.inputs['Image'])
+        tree.links.new(glare.outputs['Image'], comp.inputs['Image'])
+    return {"compositor_node": "Glare", "type": glare_type}
+
+
+def add_color_correction(brightness=0, contrast=0, saturation=1.0):
+    """Add brightness/contrast/saturation adjustment in compositor.
+
+    Example: add_color_correction(brightness=0.1, contrast=0.2,
+                                  saturation=1.2)
+    """
+    import bpy
+    bpy.context.scene.use_nodes = True
+    tree = bpy.context.scene.node_tree
+    bc = tree.nodes.new('CompositorNodeBrightContrast')
+    bc.inputs['Bright'].default_value = brightness
+    bc.inputs['Contrast'].default_value = contrast
+    hue_sat = tree.nodes.new('CompositorNodeHueSat')
+    hue_sat.inputs['Saturation'].default_value = saturation
+    rl = None
+    comp = None
+    for node in tree.nodes:
+        if node.type == 'R_LAYERS':
+            rl = node
+        elif node.type == 'COMPOSITE':
+            comp = node
+    if rl and comp:
+        for link in list(tree.links):
+            if link.from_node == rl and link.to_node == comp:
+                tree.links.remove(link)
+        bc.location = (rl.location.x + 300, rl.location.y)
+        hue_sat.location = (rl.location.x + 500, rl.location.y)
+        tree.links.new(rl.outputs['Image'], bc.inputs['Image'])
+        tree.links.new(bc.outputs['Image'], hue_sat.inputs['Image'])
+        tree.links.new(hue_sat.outputs['Image'], comp.inputs['Image'])
+    return {"brightness": brightness, "contrast": contrast,
+            "saturation": saturation}
+
+
+def add_depth_of_field(camera_obj=None, focus_object=None,
+                       focus_distance=10.0, fstop=2.8):
+    """Enable depth of field on a camera.
+
+    Example:
+        cam = get("Camera")
+        add_depth_of_field(cam, focus_object=get("Character"), fstop=1.4)
+    """
+    import bpy
+    if camera_obj is None:
+        camera_obj = bpy.context.scene.camera
+    if not camera_obj or camera_obj.type != 'CAMERA':
+        return {"error": "no camera found"}
+    cam = camera_obj.data
+    cam.dof.use_dof = True
+    if focus_object:
+        cam.dof.focus_object = focus_object
+    else:
+        cam.dof.focus_distance = focus_distance
+    cam.dof.aperture_fstop = fstop
+    return {"camera": camera_obj.name, "fstop": fstop}
+
+
+def add_vignette(amount=0.5):
+    """Add a vignette effect in the compositor.
+
+    Example: add_vignette(0.7)
+    """
+    import bpy
+    bpy.context.scene.use_nodes = True
+    tree = bpy.context.scene.node_tree
+    ellipse = tree.nodes.new('CompositorNodeEllipseMask')
+    ellipse.width = 0.9
+    ellipse.height = 0.9
+    blur = tree.nodes.new('CompositorNodeBlur')
+    blur.size_x = 200
+    blur.size_y = 200
+    blur.use_relative = False
+    multiply = tree.nodes.new('CompositorNodeMixRGB')
+    multiply.blend_type = 'MULTIPLY'
+    multiply.inputs['Fac'].default_value = amount
+    tree.links.new(ellipse.outputs['Mask'], blur.inputs['Image'])
+    rl = None
+    comp = None
+    for node in tree.nodes:
+        if node.type == 'R_LAYERS':
+            rl = node
+        elif node.type == 'COMPOSITE':
+            comp = node
+    if rl and comp:
+        for link in list(tree.links):
+            if link.to_node == comp and link.to_socket.name == 'Image':
+                tree.links.remove(link)
+        tree.links.new(rl.outputs['Image'], multiply.inputs[1])
+        tree.links.new(blur.outputs['Image'], multiply.inputs[2])
+        tree.links.new(multiply.outputs['Image'], comp.inputs['Image'])
+    return {"vignette": amount}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SCENE & TIMELINE UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_scene_info():
+    """Get comprehensive scene information.
+
+    Example: info = get_scene_info()
+    """
+    import bpy
+    sc = bpy.context.scene
+    objects = []
+    for obj in sc.objects:
+        info = {"name": obj.name, "type": obj.type,
+                "location": [round(v, 3) for v in obj.location]}
+        if obj.type == 'MESH' and obj.data:
+            info["vertices"] = len(obj.data.vertices)
+            info["faces"] = len(obj.data.polygons)
+        if obj.type == 'ARMATURE' and obj.data:
+            info["bones"] = len(obj.data.bones)
+        if obj.constraints:
+            info["constraints"] = [c.type for c in obj.constraints]
+        if obj.particle_systems:
+            info["particles"] = [ps.name for ps in obj.particle_systems]
+        if obj.rigid_body:
+            info["rigid_body"] = obj.rigid_body.type
+        if obj.animation_data and obj.animation_data.action:
+            info["action"] = obj.animation_data.action.name
+        objects.append(info)
+    return {
+        "frame_range": [sc.frame_start, sc.frame_end],
+        "fps": sc.render.fps,
+        "render_engine": sc.render.engine,
+        "resolution": f"{sc.render.resolution_x}x{sc.render.resolution_y}",
+        "gravity": [round(v, 3) for v in sc.gravity],
+        "objects": objects,
+    }
+
+
+def list_actions():
+    """List all actions (animation clips) in the file.
+
+    Example: actions = list_actions()
+    """
+    import bpy
+    return [{"name": a.name,
+             "frame_range": [int(a.frame_range[0]), int(a.frame_range[1])],
+             "curves": len(a.fcurves)}
+            for a in bpy.data.actions]
+
+
+def list_materials():
+    """List all materials in the file with basic info.
+
+    Example: mats = list_materials()
+    """
+    import bpy
+    result = []
+    for mat in bpy.data.materials:
+        info = {"name": mat.name, "use_nodes": mat.use_nodes}
+        if mat.use_nodes and mat.node_tree:
+            info["nodes"] = len(mat.node_tree.nodes)
+        result.append(info)
+    return result
+
+
+def set_active_camera(camera_obj):
+    """Set the active scene camera.
+
+    Example: set_active_camera(get("Camera.002"))
+    """
+    import bpy
+    bpy.context.scene.camera = camera_obj
+    return {"camera": camera_obj.name}
+
+
+def add_camera(name="Camera", location=(10, -10, 8), look_at=(0, 0, 0),
+               lens=50, sensor_width=36):
+    """Add a camera aimed at a target point.
+
+    Example: cam = add_camera("MainCam", location=(15, -15, 10),
+                              look_at=(0, 0, 2), lens=85)
+    """
+    import bpy
+    from mathutils import Vector
+    cam_data = bpy.data.cameras.new(name)
+    cam_data.lens = lens
+    cam_data.sensor_width = sensor_width
+    cam_obj = bpy.data.objects.new(name, cam_data)
+    bpy.context.collection.objects.link(cam_obj)
+    cam_obj.location = location
+    direction = Vector(look_at) - Vector(location)
+    rot = direction.to_track_quat('-Z', 'Y')
+    cam_obj.rotation_euler = rot.to_euler()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SCENE INSPECTION TOOLS  —  designed for LLM reasoning
+# ═══════════════════════════════════════════════════════════════════
+
+def inspect_timeline():
+    """Return a structured timeline overview: fps, frame range, playback, and
+    per-object keyframe summary with human-readable timestamps.
+
+    Output format for each animated object:
+      Object "Cube": location
+        0.00s [0.0, 0.0, 0.0] → 1.00s [3.0, 0.0, 2.0] → 2.00s [5.0, 0.0, 0.0]
+      Object "Cube": rotation_euler
+        0.00s [0.0, 0.0, 0.0] → 1.00s [0.0, 0.0, 1.571]
+
+    Example: tl = inspect_timeline()
+    """
+    import bpy
+    scene = bpy.context.scene
+    fps = scene.render.fps / scene.render.fps_base
+    frame_start = scene.frame_start
+    frame_end = scene.frame_end
+    frame_current = scene.frame_current
+    duration = (frame_end - frame_start) / fps
+
+    result = {
+        "fps": round(fps, 2),
+        "frame_start": frame_start,
+        "frame_end": frame_end,
+        "frame_current": frame_current,
+        "duration_seconds": round(duration, 3),
+        "total_frames": frame_end - frame_start + 1,
+        "objects": [],
+    }
+
+    for obj in bpy.data.objects:
+        if not obj.animation_data or not obj.animation_data.action:
+            continue
+        action = obj.animation_data.action
+        channels = {}
+        for fc in action.fcurves:
+            dp = fc.data_path
+            idx = fc.array_index
+            key = dp
+            if key not in channels:
+                channels[key] = {}
+            for kp in fc.keyframe_points:
+                frame = int(kp.co[0])
+                t = round((frame - frame_start) / fps, 3)
+                if frame not in channels[key]:
+                    channels[key][frame] = {"time": t, "values": {}}
+                channels[key][frame]["values"][idx] = round(kp.co[1], 4)
+
+        obj_info = {"name": obj.name, "action": action.name, "channels": []}
+        for dp, frames in channels.items():
+            channel = {"property": dp, "keyframes": []}
+            for frame in sorted(frames.keys()):
+                kf = frames[frame]
+                vals = kf["values"]
+                val_list = [vals.get(i, 0.0) for i in range(max(vals.keys()) + 1)] if vals else []
+                channel["keyframes"].append({
+                    "frame": frame,
+                    "time": kf["time"],
+                    "values": val_list,
+                })
+            obj_info["channels"].append(channel)
+        result["objects"].append(obj_info)
+
+    # Also list NLA tracks
+    nla_objects = []
+    for obj in bpy.data.objects:
+        if obj.animation_data and obj.animation_data.nla_tracks:
+            tracks = []
+            for track in obj.animation_data.nla_tracks:
+                strips = []
+                for strip in track.strips:
+                    strips.append({
+                        "name": strip.name,
+                        "action": strip.action.name if strip.action else None,
+                        "frame_start": round(strip.frame_start, 1),
+                        "frame_end": round(strip.frame_end, 1),
+                        "blend_type": strip.blend_type,
+                    })
+                tracks.append({"name": track.name, "mute": track.mute,
+                                "strips": strips})
+            nla_objects.append({"name": obj.name, "tracks": tracks})
+    if nla_objects:
+        result["nla"] = nla_objects
+
+    # Format a human-readable summary for the LLM
+    lines = [
+        "Timeline: {fps}fps, frames {fs}-{fe} ({dur}s), current frame {fc}".format(
+            fps=result["fps"], fs=frame_start, fe=frame_end,
+            dur=result["duration_seconds"], fc=frame_current),
+    ]
+    for obj_info in result["objects"]:
+        for ch in obj_info["channels"]:
+            arrows = []
+            for kf in ch["keyframes"]:
+                arrows.append("{t}s {v}".format(t=kf["time"], v=kf["values"]))
+            lines.append('  {name}: {prop}'.format(name=obj_info["name"],
+                                                    prop=ch["property"]))
+            lines.append('    ' + ' → '.join(arrows))
+    result["summary"] = '\n'.join(lines)
+    return result
+
+
+def inspect_animation(obj):
+    """Return detailed animation info for one object: all FCurves, keyframes
+    with timestamps, interpolation type, handles, and bone poses.
+
+    Example: anim = inspect_animation(get("Character"))
+    """
+    import bpy
+    scene = bpy.context.scene
+    fps = scene.render.fps / scene.render.fps_base
+    fs = scene.frame_start
+
+    result = {"name": obj.name, "animated": False}
+
+    if not obj.animation_data:
+        return result
+
+    ad = obj.animation_data
+    result["animated"] = True
+    result["action"] = ad.action.name if ad.action else None
+    result["influence"] = round(ad.action_influence, 3)
+
+    if ad.action:
+        channels = []
+        for fc in ad.action.fcurves:
+            kfs = []
+            for kp in fc.keyframe_points:
+                kfs.append({
+                    "frame": int(kp.co[0]),
+                    "time": round((kp.co[0] - fs) / fps, 3),
+                    "value": round(kp.co[1], 4),
+                    "interpolation": kp.interpolation,
+                    "easing": kp.easing,
+                    "handle_left": [round(kp.handle_left[0], 2),
+                                    round(kp.handle_left[1], 4)],
+                    "handle_right": [round(kp.handle_right[0], 2),
+                                     round(kp.handle_right[1], 4)],
+                })
+            channels.append({
+                "data_path": fc.data_path,
+                "array_index": fc.array_index,
+                "keyframes": kfs,
+                "mute": fc.mute,
+            })
+        result["channels"] = channels
+
+    # NLA
+    if ad.nla_tracks:
+        tracks = []
+        for track in ad.nla_tracks:
+            strips = []
+            for strip in track.strips:
+                strips.append({
+                    "name": strip.name,
+                    "action": strip.action.name if strip.action else None,
+                    "frame_start": round(strip.frame_start, 1),
+                    "frame_end": round(strip.frame_end, 1),
+                    "scale": round(strip.scale, 3),
+                    "repeat": round(strip.repeat, 3),
+                    "blend_type": strip.blend_type,
+                    "influence": round(strip.influence, 3),
+                })
+            tracks.append({"name": track.name, "mute": track.mute,
+                            "strips": strips})
+        result["nla_tracks"] = tracks
+
+    # Drivers
+    if ad.drivers:
+        drivers = []
+        for d in ad.drivers:
+            drivers.append({
+                "data_path": d.data_path,
+                "array_index": d.array_index,
+                "expression": d.driver.expression if d.driver else None,
+            })
+        result["drivers"] = drivers
+
+    return result
+
+
+def inspect_materials_detail(obj=None):
+    """Return detailed material info for one object or all materials in scene.
+
+    If *obj* is given, returns materials assigned to that object with slot
+    indices and node tree overview.  If *obj* is None, lists all scene materials.
+
+    Example: mats = inspect_materials_detail(get("Sword"))
+             all_mats = inspect_materials_detail()
+    """
+    import bpy
+
+    def _mat_info(mat):
+        info = {
+            "name": mat.name,
+            "use_nodes": mat.use_nodes,
+            "blend_method": getattr(mat, 'blend_method', 'OPAQUE'),
+        }
+        if mat.use_nodes and mat.node_tree:
+            nodes = []
+            for n in mat.node_tree.nodes:
+                nd = {"type": n.type, "name": n.name, "label": n.label}
+                # Extract key values from common node types
+                if n.type == 'BSDF_PRINCIPLED':
+                    for inp_name in ['Base Color', 'Metallic', 'Roughness',
+                                     'IOR', 'Alpha', 'Emission Color',
+                                     'Emission Strength', 'Subsurface Weight']:
+                        inp = n.inputs.get(inp_name)
+                        if inp is not None and not inp.is_linked:
+                            val = inp.default_value
+                            if hasattr(val, '__len__'):
+                                nd[inp_name.lower().replace(' ', '_')] = [
+                                    round(v, 3) for v in val]
+                            else:
+                                nd[inp_name.lower().replace(' ', '_')] = round(
+                                    val, 3)
+                elif n.type == 'TEX_IMAGE':
+                    nd["image"] = n.image.name if n.image else None
+                    nd["interpolation"] = n.interpolation
+                elif n.type == 'MIX_RGB' or n.type == 'MIX':
+                    nd["blend_type"] = n.blend_type
+                elif n.type == 'MAPPING':
+                    if hasattr(n, 'inputs'):
+                        loc_inp = n.inputs.get('Location')
+                        scale_inp = n.inputs.get('Scale')
+                        if loc_inp and not loc_inp.is_linked:
+                            nd["mapping_location"] = [
+                                round(v, 3) for v in loc_inp.default_value]
+                        if scale_inp and not scale_inp.is_linked:
+                            nd["mapping_scale"] = [
+                                round(v, 3) for v in scale_inp.default_value]
+                nodes.append(nd)
+            info["nodes"] = nodes
+            # Summarize links
+            links = []
+            for lnk in mat.node_tree.links:
+                links.append("{f}.{fo} → {t}.{ti}".format(
+                    f=lnk.from_node.name, fo=lnk.from_socket.name,
+                    t=lnk.to_node.name, ti=lnk.to_socket.name))
+            info["links"] = links
+        else:
+            info["diffuse_color"] = [round(v, 3) for v in mat.diffuse_color]
+        return info
+
+    if obj is not None:
+        slots = []
+        for i, slot in enumerate(obj.material_slots):
+            if slot.material:
+                mi = _mat_info(slot.material)
+                mi["slot_index"] = i
+                slots.append(mi)
+        return {"object": obj.name, "material_slots": slots,
+                "active_index": obj.active_material_index}
+    else:
+        return [_mat_info(m) for m in bpy.data.materials
+                if m.name != "Dots Stroke"]
+
+
+def inspect_modifiers(obj):
+    """Return all modifiers on an object with their key settings.
+
+    Example: mods = inspect_modifiers(get("Sword"))
+    """
+    result = []
+    for mod in obj.modifiers:
+        info = {"name": mod.name, "type": mod.type, "show_viewport": mod.show_viewport,
+                "show_render": mod.show_render}
+        # Extract key settings per modifier type
+        if mod.type == 'SUBSURF':
+            info["levels"] = mod.levels
+            info["render_levels"] = mod.render_levels
+            info["subdivision_type"] = mod.subdivision_type
+        elif mod.type == 'MIRROR':
+            info["use_axis"] = [mod.use_axis[0], mod.use_axis[1], mod.use_axis[2]]
+            info["use_clip"] = mod.use_clip
+        elif mod.type == 'BEVEL':
+            info["width"] = round(mod.width, 4)
+            info["segments"] = mod.segments
+            info["limit_method"] = mod.limit_method
+        elif mod.type == 'BOOLEAN':
+            info["operation"] = mod.operation
+            info["object"] = mod.object.name if mod.object else None
+            info["solver"] = mod.solver
+        elif mod.type == 'SOLIDIFY':
+            info["thickness"] = round(mod.thickness, 4)
+            info["offset"] = round(mod.offset, 4)
+        elif mod.type == 'ARRAY':
+            info["count"] = mod.count
+            info["relative_offset"] = [round(v, 4) for v in mod.relative_offset_displace]
+            info["use_merge_vertices"] = mod.use_merge_vertices
+        elif mod.type == 'ARMATURE':
+            info["armature"] = mod.object.name if mod.object else None
+        elif mod.type == 'SHRINKWRAP':
+            info["target"] = mod.target.name if mod.target else None
+            info["wrap_method"] = mod.wrap_method
+        elif mod.type == 'DECIMATE':
+            info["decimate_type"] = mod.decimate_type
+            info["ratio"] = round(mod.ratio, 4)
+        elif mod.type == 'PARTICLE_SYSTEM':
+            ps = mod.particle_system
+            if ps and ps.settings:
+                info["particle_count"] = ps.settings.count
+                info["particle_type"] = ps.settings.type
+        elif mod.type == 'NODES':
+            info["node_group"] = mod.node_group.name if mod.node_group else None
+        result.append(info)
+    return {"object": obj.name, "modifiers": result, "count": len(result)}
+
+
+def inspect_constraints(obj):
+    """Return all constraints on an object with their key settings.
+
+    Example: cons = inspect_constraints(get("Camera"))
+    """
+    result = []
+    for con in obj.constraints:
+        info = {
+            "name": con.name,
+            "type": con.type,
+            "mute": con.mute,
+            "influence": round(con.influence, 3),
+        }
+        if hasattr(con, 'target') and con.target:
+            info["target"] = con.target.name
+        if hasattr(con, 'subtarget') and con.subtarget:
+            info["subtarget"] = con.subtarget
+        # Type-specific
+        if con.type == 'TRACK_TO':
+            info["track_axis"] = con.track_axis
+            info["up_axis"] = con.up_axis
+        elif con.type == 'IK':
+            info["chain_count"] = con.chain_count
+            info["use_rotation"] = con.use_rotation
+            if con.pole_target:
+                info["pole_target"] = con.pole_target.name
+        elif con.type in ('COPY_LOCATION', 'COPY_ROTATION', 'COPY_SCALE'):
+            info["use_x"] = con.use_x
+            info["use_y"] = con.use_y
+            info["use_z"] = con.use_z
+        elif con.type == 'LIMIT_ROTATION':
+            info["use_limit_x"] = con.use_limit_x
+            info["min_x"] = round(con.min_x, 4)
+            info["max_x"] = round(con.max_x, 4)
+        elif con.type == 'FLOOR':
+            info["floor_location"] = con.floor_location
+        result.append(info)
+    return {"object": obj.name, "constraints": result, "count": len(result)}
+
+
+def inspect_armature(obj):
+    """Return detailed armature info: bone hierarchy, pose bones with
+    current transforms, constraints per bone, and IK chains.
+
+    Example: arm = inspect_armature(get("Armature"))
+    """
+    if obj.type != 'ARMATURE' or not obj.data:
+        return {"error": "{} is not an armature".format(obj.name)}
+
+    armature = obj.data
+    bones = []
+    for bone in armature.bones:
+        b = {
+            "name": bone.name,
+            "head": [round(v, 4) for v in bone.head_local],
+            "tail": [round(v, 4) for v in bone.tail_local],
+            "length": round(bone.length, 4),
+            "parent": bone.parent.name if bone.parent else None,
+            "children": [c.name for c in bone.children],
+            "connected": bone.use_connect,
+            "deform": bone.use_deform,
+        }
+        bones.append(b)
+
+    # Pose bone info
+    pose_info = []
+    if obj.pose:
+        for pb in obj.pose.bones:
+            pi = {
+                "name": pb.name,
+                "location": [round(v, 4) for v in pb.location],
+                "rotation": [round(v, 4) for v in pb.rotation_euler],
+                "scale": [round(v, 4) for v in pb.scale],
+                "rotation_mode": pb.rotation_mode,
+            }
+            # Bone constraints
+            if pb.constraints:
+                pi["constraints"] = []
+                for con in pb.constraints:
+                    ci = {"name": con.name, "type": con.type,
+                          "mute": con.mute,
+                          "influence": round(con.influence, 3)}
+                    if hasattr(con, 'target') and con.target:
+                        ci["target"] = con.target.name
+                    if hasattr(con, 'subtarget') and con.subtarget:
+                        ci["subtarget"] = con.subtarget
+                    if con.type == 'IK':
+                        ci["chain_count"] = con.chain_count
+                    pi["constraints"].append(ci)
+            pose_info.append(pi)
+
+    # Build hierarchy summary
+    root_bones = [b["name"] for b in bones if b["parent"] is None]
+    ik_chains = []
+    if obj.pose:
+        for pb in obj.pose.bones:
+            for con in pb.constraints:
+                if con.type == 'IK':
+                    chain = [pb.name]
+                    parent = pb.parent
+                    count = con.chain_count if con.chain_count > 0 else 99
+                    while parent and len(chain) < count:
+                        chain.append(parent.name)
+                        parent = parent.parent
+                    ik_chains.append({
+                        "tip": pb.name,
+                        "chain": list(reversed(chain)),
+                        "target": con.target.name if con.target else None,
+                    })
+
+    return {
+        "name": obj.name,
+        "armature": armature.name,
+        "bone_count": len(bones),
+        "bones": bones,
+        "pose_bones": pose_info,
+        "root_bones": root_bones,
+        "ik_chains": ik_chains,
+    }
+
+
+def inspect_physics(obj=None):
+    """Return physics settings for one object or all objects with physics.
+
+    Example: phys = inspect_physics(get("Cloth"))
+             all_phys = inspect_physics()
+    """
+    import bpy
+
+    def _phys_info(o):
+        info = {"name": o.name, "physics": []}
+        # Rigid body
+        if o.rigid_body:
+            rb = o.rigid_body
+            info["physics"].append({
+                "type": "RIGID_BODY",
+                "body_type": rb.type,
+                "mass": round(rb.mass, 3),
+                "collision_shape": rb.collision_shape,
+                "friction": round(rb.friction, 3),
+                "restitution": round(rb.restitution, 3),
+                "enabled": rb.enabled,
+                "kinematic": rb.kinematic,
+            })
+        # Check modifiers for physics types
+        for mod in o.modifiers:
+            if mod.type == 'CLOTH':
+                s = mod.settings
+                info["physics"].append({
+                    "type": "CLOTH",
+                    "quality": s.quality,
+                    "mass": round(s.mass, 3),
+                    "tension_stiffness": round(s.tension_stiffness, 3),
+                    "use_pressure": getattr(s, 'use_pressure', False),
+                })
+            elif mod.type == 'SOFT_BODY':
+                s = mod.settings
+                info["physics"].append({
+                    "type": "SOFT_BODY",
+                    "mass": round(s.mass, 3),
+                    "friction": round(s.friction, 3),
+                    "speed": round(s.speed, 3),
+                })
+            elif mod.type == 'FLUID':
+                info["physics"].append({
+                    "type": "FLUID",
+                    "fluid_type": getattr(mod, 'fluid_type', 'NONE'),
+                })
+            elif mod.type == 'COLLISION':
+                s = mod.settings
+                info["physics"].append({
+                    "type": "COLLISION",
+                    "thickness_outer": round(s.thickness_outer, 4),
+                    "damping": round(s.damping, 3),
+                })
+            elif mod.type == 'PARTICLE_SYSTEM':
+                ps = mod.particle_system
+                if ps and ps.settings:
+                    s = ps.settings
+                    info["physics"].append({
+                        "type": "PARTICLES",
+                        "count": s.count,
+                        "particle_type": s.type,
+                        "lifetime": round(s.lifetime, 1),
+                        "emit_from": s.emit_from,
+                    })
+        return info if info["physics"] else None
+
+    if obj is not None:
+        result = _phys_info(obj)
+        return result if result else {"name": obj.name, "physics": []}
+    else:
+        all_phys = []
+        for o in bpy.data.objects:
+            info = _phys_info(o)
+            if info:
+                all_phys.append(info)
+        return {"physics_objects": all_phys, "count": len(all_phys)}
+
+
+def inspect_shape_keys(obj):
+    """Return all shape keys on a mesh with their values, ranges, and drivers.
+
+    Example: sks = inspect_shape_keys(get("Face"))
+    """
+    if not obj.data or not obj.data.shape_keys:
+        return {"name": obj.name, "shape_keys": []}
+
+    sk = obj.data.shape_keys
+    blocks = []
+    for kb in sk.key_blocks:
+        info = {
+            "name": kb.name,
+            "value": round(kb.value, 4),
+            "slider_min": round(kb.slider_min, 4),
+            "slider_max": round(kb.slider_max, 4),
+            "mute": kb.mute,
+            "relative_key": kb.relative_key.name if kb.relative_key else None,
+        }
+        # Check for driver
+        if sk.animation_data:
+            for drv in sk.animation_data.drivers:
+                if kb.name in drv.data_path:
+                    info["driver"] = drv.driver.expression
+                    break
+        blocks.append(info)
+
+    return {
+        "name": obj.name,
+        "use_relative": sk.use_relative,
+        "reference_key": sk.reference_key.name if sk.reference_key else None,
+        "shape_keys": blocks,
+        "count": len(blocks),
+    }
+
+
+def inspect_vertex_groups(obj):
+    """Return all vertex groups on an object with vertex counts per group.
+
+    Example: vgs = inspect_vertex_groups(get("Character"))
+    """
+    if not obj.type == 'MESH':
+        return {"error": "{} is not a mesh".format(obj.name)}
+
+    groups = []
+    for vg in obj.vertex_groups:
+        count = 0
+        for v in obj.data.vertices:
+            for g in v.groups:
+                if g.group == vg.index:
+                    count += 1
+                    break
+        groups.append({
+            "name": vg.name,
+            "index": vg.index,
+            "lock_weight": vg.lock_weight,
+            "vertex_count": count,
+        })
+
+    return {
+        "name": obj.name,
+        "vertex_groups": groups,
+        "count": len(groups),
+        "total_vertices": len(obj.data.vertices),
+    }
+
+
+def inspect_uv_maps(obj):
+    """Return UV map info for a mesh object.
+
+    Example: uvs = inspect_uv_maps(get("Sword"))
+    """
+    if obj.type != 'MESH' or not obj.data:
+        return {"error": "{} is not a mesh".format(obj.name)}
+
+    uv_layers = []
+    for uv in obj.data.uv_layers:
+        uv_layers.append({
+            "name": uv.name,
+            "active": uv.active,
+            "active_render": uv.active_render,
+        })
+
+    return {
+        "name": obj.name,
+        "uv_maps": uv_layers,
+        "count": len(uv_layers),
+    }
+
+
+def inspect_scene_hierarchy():
+    """Return the full scene collection hierarchy with all objects,
+    their parent-child relationships, and collection membership.
+
+    Example: hier = inspect_scene_hierarchy()
+    """
+    import bpy
+
+    def _collection_tree(col, depth=0):
+        items = []
+        for obj in col.objects:
+            item = {
+                "name": obj.name,
+                "type": obj.type,
+                "parent": obj.parent.name if obj.parent else None,
+                "visible": obj.visible_get(),
+            }
+            if obj.children:
+                item["children"] = [c.name for c in obj.children]
+            items.append(item)
+        children = []
+        for child_col in col.children:
+            children.append(_collection_tree(child_col, depth + 1))
+        return {
+            "name": col.name,
+            "objects": items,
+            "children": children,
+        }
+
+    scene = bpy.context.scene
+    tree = _collection_tree(scene.collection)
+
+    # Object parenting overview
+    parented = []
+    for obj in bpy.data.objects:
+        if obj.parent:
+            parented.append({
+                "child": obj.name,
+                "parent": obj.parent.name,
+                "parent_type": obj.parent_type,
+            })
+
+    return {
+        "scene": scene.name,
+        "hierarchy": tree,
+        "parent_relationships": parented,
+        "total_objects": len(bpy.data.objects),
+    }
+
+
+def inspect_render_settings():
+    """Return current render settings: engine, resolution, output, samples.
+
+    Example: rs = inspect_render_settings()
+    """
+    import bpy
+    scene = bpy.context.scene
+    render = scene.render
+
+    result = {
+        "engine": render.engine,
+        "resolution_x": render.resolution_x,
+        "resolution_y": render.resolution_y,
+        "resolution_percentage": render.resolution_percentage,
+        "fps": render.fps,
+        "fps_base": render.fps_base,
+        "frame_start": scene.frame_start,
+        "frame_end": scene.frame_end,
+        "film_transparent": render.film_transparent,
+        "output_path": render.filepath,
+        "file_format": render.image_settings.file_format,
+        "color_mode": render.image_settings.color_mode,
+    }
+
+    # Engine-specific
+    if render.engine == 'CYCLES':
+        cycles = scene.cycles
+        result["cycles"] = {
+            "samples": cycles.samples,
+            "preview_samples": cycles.preview_samples,
+            "use_denoising": cycles.use_denoising,
+            "device": cycles.device,
+        }
+    elif render.engine == 'BLENDER_EEVEE_NEXT' or render.engine == 'BLENDER_EEVEE':
+        eevee = scene.eevee
+        result["eevee"] = {
+            "taa_render_samples": getattr(eevee, 'taa_render_samples', None),
+            "use_bloom": getattr(eevee, 'use_bloom', None),
+            "use_ssr": getattr(eevee, 'use_ssr', None),
+            "use_gtao": getattr(eevee, 'use_gtao', None),
+        }
+
+    return result
+
+
+def inspect_world():
+    """Return world/environment settings: background, HDRI, volume.
+
+    Example: w = inspect_world()
+    """
+    import bpy
+    world = bpy.context.scene.world
+    if not world:
+        return {"world": None}
+
+    result = {"name": world.name, "use_nodes": world.use_nodes}
+    if world.use_nodes and world.node_tree:
+        nodes = []
+        for n in world.node_tree.nodes:
+            nd = {"type": n.type, "name": n.name}
+            if n.type == 'BACKGROUND':
+                color_inp = n.inputs.get('Color')
+                strength_inp = n.inputs.get('Strength')
+                if color_inp and not color_inp.is_linked:
+                    nd["color"] = [round(v, 3) for v in color_inp.default_value]
+                if strength_inp and not strength_inp.is_linked:
+                    nd["strength"] = round(strength_inp.default_value, 3)
+            elif n.type == 'TEX_ENVIRONMENT':
+                nd["image"] = n.image.name if n.image else None
+            elif n.type == 'TEX_SKY':
+                nd["sky_type"] = n.sky_type
+                nd["sun_elevation"] = round(n.sun_elevation, 4)
+                nd["sun_rotation"] = round(n.sun_rotation, 4)
+            nodes.append(nd)
+        result["nodes"] = nodes
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SHADER NODE EDITING  —  generic node manipulation for Qwen
+# ═══════════════════════════════════════════════════════════════════
+
+def _ensure_node_tree(mat):
+    """Internal: make sure a material has a node tree."""
+    if not mat.use_nodes:
+        mat.use_nodes = True
+    return mat.node_tree
+
+
+def _auto_arrange_tree(tree, x_spacing=250, y_spacing=80):
+    """Auto-arrange nodes in a clean left-to-right horizontal layout.
+
+    Performs a topological sort from Output/Composite backwards, then
+    places nodes in columns with consistent spacing — like a real
+    Blender artist would lay them out.
+    """
+    if not tree or not tree.nodes:
+        return
+
+    # Find sink nodes (Output Material, Composite, Viewer, etc.)
+    sinks = [n for n in tree.nodes if n.type in (
+        'OUTPUT_MATERIAL', 'COMPOSITE', 'VIEWER', 'OUTPUT_WORLD',
+        'OUTPUT_LIGHT')]
+    if not sinks:
+        sinks = [n for n in tree.nodes if not any(
+            lnk.from_node == n for lnk in tree.links)]
+    if not sinks:
+        return
+
+    # BFS backwards from sinks to assign depth (column)
+    depth = {}
+    visited = set()
+    queue = [(s, 0) for s in sinks]
+    for node, d in queue:
+        if id(node) in visited:
+            if d > depth.get(id(node), 0):
+                depth[id(node)] = d
+            continue
+        visited.add(id(node))
+        depth[id(node)] = max(depth.get(id(node), 0), d)
+        for inp in node.inputs:
+            for lnk in inp.links:
+                queue.append((lnk.from_node, d + 1))
+
+    # Unconnected nodes get placed far left
+    max_depth = max(depth.values()) if depth else 0
+    for node in tree.nodes:
+        if id(node) not in depth:
+            max_depth += 1
+            depth[id(node)] = max_depth
+
+    # Group by column
+    columns = {}
+    for node in tree.nodes:
+        d = depth.get(id(node), 0)
+        columns.setdefault(d, []).append(node)
+
+    # Place: rightmost column at x=0, going left
+    max_col = max(columns.keys()) if columns else 0
+    for col_idx, nodes_in_col in sorted(columns.items()):
+        x = (max_col - col_idx) * x_spacing
+        total_height = sum(max(n.height, 150) + y_spacing
+                          for n in nodes_in_col) - y_spacing
+        y = total_height / 2
+        for node in nodes_in_col:
+            node.location.x = x
+            node.location.y = y
+            y -= max(node.height, 150) + y_spacing
+
+
+def add_shader_node(mat, node_type, name=None, location=None, **kwargs):
+    """Add a shader node to a material's node tree.
+
+    node_type: Blender node type string, e.g.:
+      'ShaderNodeBsdfPrincipled', 'ShaderNodeTexNoise',
+      'ShaderNodeTexImage', 'ShaderNodeMix', 'ShaderNodeBump',
+      'ShaderNodeNormalMap', 'ShaderNodeTexCoord',
+      'ShaderNodeMapping', 'ShaderNodeMath', 'ShaderNodeValToRGB',
+      'ShaderNodeSeparateXYZ', 'ShaderNodeTexVoronoi',
+      'ShaderNodeTexMusgrave', 'ShaderNodeInvert',
+      'ShaderNodeMixShader', 'ShaderNodeBsdfGlass',
+      'ShaderNodeBsdfDiffuse', 'ShaderNodeEmission'
+
+    Shorthand aliases also accepted (case-insensitive):
+      'principled', 'noise', 'voronoi', 'image', 'mix', 'colorramp',
+      'math', 'bump', 'normalmap', 'mapping', 'texcoord', 'separate_xyz',
+      'musgrave', 'invert', 'mix_shader', 'glass', 'emission',
+      'diffuse', 'wave', 'gradient', 'fresnel', 'layer_weight'
+
+    Returns the created node.
+
+    Example:
+        mat = quick_material("Rock")
+        noise = add_shader_node(mat, 'noise', name='RockNoise')
+        set_node_input(noise, 'Scale', 15.0)
+        set_node_input(noise, 'Detail', 8.0)
+        ramp = add_shader_node(mat, 'colorramp', name='ColorVariation')
+        connect_nodes(mat, noise, 'Fac', ramp, 'Fac')
+        bsdf = get_node(mat, 'Principled BSDF')
+        connect_nodes(mat, ramp, 'Color', bsdf, 'Base Color')
+        auto_arrange_nodes(mat)
+    """
+    _ALIASES = {
+        'principled': 'ShaderNodeBsdfPrincipled',
+        'noise': 'ShaderNodeTexNoise',
+        'voronoi': 'ShaderNodeTexVoronoi',
+        'image': 'ShaderNodeTexImage',
+        'mix': 'ShaderNodeMix',
+        'mix_rgb': 'ShaderNodeMixRGB',
+        'colorramp': 'ShaderNodeValToRGB',
+        'color_ramp': 'ShaderNodeValToRGB',
+        'math': 'ShaderNodeMath',
+        'bump': 'ShaderNodeBump',
+        'normalmap': 'ShaderNodeNormalMap',
+        'normal_map': 'ShaderNodeNormalMap',
+        'mapping': 'ShaderNodeMapping',
+        'texcoord': 'ShaderNodeTexCoord',
+        'tex_coord': 'ShaderNodeTexCoord',
+        'separate_xyz': 'ShaderNodeSeparateXYZ',
+        'combine_xyz': 'ShaderNodeCombineXYZ',
+        'musgrave': 'ShaderNodeTexMusgrave',
+        'invert': 'ShaderNodeInvert',
+        'mix_shader': 'ShaderNodeMixShader',
+        'add_shader': 'ShaderNodeAddShader',
+        'glass': 'ShaderNodeBsdfGlass',
+        'emission': 'ShaderNodeEmission',
+        'diffuse': 'ShaderNodeBsdfDiffuse',
+        'transparent': 'ShaderNodeBsdfTransparent',
+        'glossy': 'ShaderNodeBsdfGlossy',
+        'wave': 'ShaderNodeTexWave',
+        'gradient': 'ShaderNodeTexGradient',
+        'checker': 'ShaderNodeTexChecker',
+        'brick': 'ShaderNodeTexBrick',
+        'fresnel': 'ShaderNodeFresnel',
+        'layer_weight': 'ShaderNodeLayerWeight',
+        'rgb': 'ShaderNodeRGB',
+        'value': 'ShaderNodeValue',
+        'displacement': 'ShaderNodeDisplacement',
+        'vector_math': 'ShaderNodeVectorMath',
+        'clamp': 'ShaderNodeClamp',
+        'map_range': 'ShaderNodeMapRange',
+        'ambient_occlusion': 'ShaderNodeAmbientOcclusion',
+        'ao': 'ShaderNodeAmbientOcclusion',
+        'output': 'ShaderNodeOutputMaterial',
+    }
+    tree = _ensure_node_tree(mat)
+    actual_type = _ALIASES.get(node_type.lower(), node_type)
+    node = tree.nodes.new(actual_type)
+    if name:
+        node.name = name
+        node.label = name
+    if location:
+        node.location = location
+    # Apply extra keyword settings
+    for key, val in kwargs.items():
+        if hasattr(node, key):
+            setattr(node, key, val)
+    return node
+
+
+def get_node(mat, name):
+    """Get a node from a material's node tree by name.
+
+    Also searches by type label (e.g., 'Principled BSDF', 'Material Output').
+
+    Example: bsdf = get_node(mat, 'Principled BSDF')
+    """
+    tree = _ensure_node_tree(mat)
+    node = tree.nodes.get(name)
+    if node:
+        return node
+    # Search by label
+    for n in tree.nodes:
+        if n.label == name or n.name == name:
+            return n
+    # Search by type display name
+    name_lower = name.lower().replace(' ', '').replace('_', '')
+    for n in tree.nodes:
+        type_name = n.bl_label.lower().replace(' ', '').replace('_', '') if hasattr(n, 'bl_label') else ''
+        if type_name == name_lower:
+            return n
+    return None
+
+
+def set_node_input(node, input_name, value):
+    """Set an input value on a shader/compositor node.
+
+    Handles color (tuple), float, int automatically.
+
+    Example:
+        bsdf = get_node(mat, 'Principled BSDF')
+        set_node_input(bsdf, 'Base Color', (0.8, 0.2, 0.1, 1))
+        set_node_input(bsdf, 'Metallic', 0.9)
+        set_node_input(bsdf, 'Roughness', 0.2)
+    """
+    inp = node.inputs.get(input_name)
+    if inp is None:
+        # Try case-insensitive match
+        for i in node.inputs:
+            if i.name.lower() == input_name.lower():
+                inp = i
+                break
+    if inp is None:
+        return {"error": "Input '{}' not found on {}".format(
+            input_name, node.name)}
+    inp.default_value = value
+    return {"node": node.name, "input": input_name, "value": str(value)}
+
+
+def get_node_input(node, input_name):
+    """Read the current value of a node input.
+
+    Example: color = get_node_input(bsdf, 'Base Color')
+    """
+    inp = node.inputs.get(input_name)
+    if inp is None:
+        for i in node.inputs:
+            if i.name.lower() == input_name.lower():
+                inp = i
+                break
+    if inp is None:
+        return {"error": "Input '{}' not found".format(input_name)}
+    val = inp.default_value
+    if hasattr(val, '__len__'):
+        return {"value": [round(v, 4) for v in val], "linked": inp.is_linked}
+    return {"value": round(val, 4) if isinstance(val, float) else val,
+            "linked": inp.is_linked}
+
+
+def connect_nodes(mat_or_tree, from_node, from_output, to_node, to_input):
+    """Connect two nodes in a material or compositor tree.
+
+    Accepts material object or node tree directly. Nodes can be objects
+    or name strings. Socket names are matched case-insensitively.
+
+    Example:
+        connect_nodes(mat, 'RockNoise', 'Fac', 'Principled BSDF', 'Roughness')
+        connect_nodes(mat, noise_node, 'Color', bsdf_node, 'Base Color')
+    """
+    if hasattr(mat_or_tree, 'node_tree'):
+        tree = mat_or_tree.node_tree
+    elif hasattr(mat_or_tree, 'nodes'):
+        tree = mat_or_tree
+    else:
+        return {"error": "Not a material or node tree"}
+
+    # Resolve nodes by name if strings
+    if isinstance(from_node, str):
+        from_node = tree.nodes.get(from_node) or get_node(mat_or_tree, from_node)
+    if isinstance(to_node, str):
+        to_node = tree.nodes.get(to_node) or get_node(mat_or_tree, to_node)
+    if not from_node or not to_node:
+        return {"error": "Node not found"}
+
+    # Find output socket
+    out_socket = None
+    for s in from_node.outputs:
+        if s.name.lower() == from_output.lower():
+            out_socket = s
+            break
+    if not out_socket:
+        out_socket = from_node.outputs.get(from_output)
+    if not out_socket and from_output.isdigit():
+        idx = int(from_output)
+        if idx < len(from_node.outputs):
+            out_socket = from_node.outputs[idx]
+
+    # Find input socket
+    in_socket = None
+    for s in to_node.inputs:
+        if s.name.lower() == to_input.lower():
+            in_socket = s
+            break
+    if not in_socket:
+        in_socket = to_node.inputs.get(to_input)
+    if not in_socket and to_input.isdigit():
+        idx = int(to_input)
+        if idx < len(to_node.inputs):
+            in_socket = to_node.inputs[idx]
+
+    if not out_socket:
+        return {"error": "Output '{}' not found on {}".format(
+            from_output, from_node.name)}
+    if not in_socket:
+        return {"error": "Input '{}' not found on {}".format(
+            to_input, to_node.name)}
+
+    # Remove existing link to this input
+    for lnk in list(tree.links):
+        if lnk.to_socket == in_socket:
+            tree.links.remove(lnk)
+
+    tree.links.new(out_socket, in_socket)
+    return {"linked": "{}.{} → {}.{}".format(
+        from_node.name, out_socket.name, to_node.name, in_socket.name)}
+
+
+def disconnect_node_input(mat_or_tree, node, input_name):
+    """Disconnect all links going into a specific node input.
+
+    Example: disconnect_node_input(mat, bsdf, 'Base Color')
+    """
+    if hasattr(mat_or_tree, 'node_tree'):
+        tree = mat_or_tree.node_tree
+    else:
+        tree = mat_or_tree
+    if isinstance(node, str):
+        node = tree.nodes.get(node)
+    if not node:
+        return {"error": "Node not found"}
+    inp = node.inputs.get(input_name)
+    if not inp:
+        return {"error": "Input not found"}
+    removed = 0
+    for lnk in list(tree.links):
+        if lnk.to_socket == inp:
+            tree.links.remove(lnk)
+            removed += 1
+    return {"disconnected": removed}
+
+
+def remove_node(mat_or_tree, node):
+    """Remove a node from a material or compositor tree.
+
+    Example: remove_node(mat, 'OldNoise')
+    """
+    if hasattr(mat_or_tree, 'node_tree'):
+        tree = mat_or_tree.node_tree
+    else:
+        tree = mat_or_tree
+    if isinstance(node, str):
+        node = tree.nodes.get(node)
+    if not node:
+        return {"error": "Node not found"}
+    name = node.name
+    tree.nodes.remove(node)
+    return {"removed": name}
+
+
+def list_node_inputs(node):
+    """List all inputs on a node with their types and current values.
+
+    Example: inputs = list_node_inputs(bsdf)
+    """
+    result = []
+    for inp in node.inputs:
+        info = {"name": inp.name, "type": inp.type, "linked": inp.is_linked}
+        if not inp.is_linked:
+            val = inp.default_value
+            if hasattr(val, '__len__'):
+                info["value"] = [round(v, 4) for v in val]
+            elif isinstance(val, float):
+                info["value"] = round(val, 4)
+            else:
+                info["value"] = val
+        result.append(info)
+    return result
+
+
+def list_node_outputs(node):
+    """List all outputs on a node with their types.
+
+    Example: outputs = list_node_outputs(noise)
+    """
+    return [{"name": s.name, "type": s.type} for s in node.outputs]
+
+
+def auto_arrange_nodes(mat_or_tree):
+    """Auto-arrange nodes in a clean horizontal left-to-right layout.
+
+    Call this after building or modifying a node tree to keep it tidy.
+
+    Example:
+        auto_arrange_nodes(mat)     # Material tree
+        auto_arrange_nodes(comp)    # Compositor tree
+    """
+    if hasattr(mat_or_tree, 'node_tree'):
+        tree = mat_or_tree.node_tree
+    elif hasattr(mat_or_tree, 'nodes'):
+        tree = mat_or_tree
+    else:
+        return {"error": "Not a material or node tree"}
+    _auto_arrange_tree(tree)
+    return {"arranged": len(tree.nodes)}
+
+
+def set_colorramp_stops(node, stops):
+    """Configure color ramp stops.
+
+    stops: list of (position, color) tuples.
+      position: 0.0-1.0
+      color: (r, g, b, a) tuple
+
+    Example:
+        ramp = add_shader_node(mat, 'colorramp')
+        set_colorramp_stops(ramp, [
+            (0.0, (0.1, 0.05, 0.02, 1)),   # dark brown
+            (0.4, (0.4, 0.25, 0.12, 1)),   # medium brown
+            (1.0, (0.7, 0.55, 0.35, 1)),   # light tan
+        ])
+    """
+    if not hasattr(node, 'color_ramp'):
+        return {"error": "Node has no color_ramp"}
+    cr = node.color_ramp
+    # Ensure enough stops
+    while len(cr.elements) < len(stops):
+        cr.elements.new(0.5)
+    # Remove extras
+    while len(cr.elements) > len(stops) and len(cr.elements) > 1:
+        cr.elements.remove(cr.elements[-1])
+    for i, (pos, color) in enumerate(stops):
+        if i < len(cr.elements):
+            cr.elements[i].position = pos
+            cr.elements[i].color = color
+    return {"stops": len(stops)}
+
+
+def set_node_property(node, prop_name, value):
+    """Set a property on a node (not an input socket, but the node itself).
+
+    Useful for: blend_type, operation, gradient_type, musgrave_type, etc.
+
+    Example:
+        math_node = add_shader_node(mat, 'math')
+        set_node_property(math_node, 'operation', 'MULTIPLY')
+
+        mix_node = add_shader_node(mat, 'mix')
+        set_node_property(mix_node, 'blend_type', 'OVERLAY')
+    """
+    if hasattr(node, prop_name):
+        setattr(node, prop_name, value)
+        return {"node": node.name, "property": prop_name, "value": str(value)}
+    return {"error": "Property '{}' not found on {}".format(prop_name, node.name)}
+
+
+def duplicate_material(mat, new_name=None):
+    """Create a copy of a material with independent node tree.
+
+    Example: mat2 = duplicate_material(find_material('Wood'), 'DarkWood')
+    """
+    new_mat = mat.copy()
+    if new_name:
+        new_mat.name = new_name
+    return new_mat
+
+
+def clear_material_nodes(mat):
+    """Remove all nodes from a material and start fresh with Output + Principled.
+
+    Example: clear_material_nodes(mat)
+    """
+    tree = _ensure_node_tree(mat)
+    tree.nodes.clear()
+    output = tree.nodes.new('ShaderNodeOutputMaterial')
+    output.location = (400, 0)
+    bsdf = tree.nodes.new('ShaderNodeBsdfPrincipled')
+    bsdf.location = (0, 0)
+    tree.links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+    return {"material": mat.name, "nodes": 2}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# COMPOSITOR NODE EDITING  —  generic node manipulation for Qwen
+# ═══════════════════════════════════════════════════════════════════
+
+def _ensure_compositor():
+    """Internal: ensure compositor is enabled and return the node tree."""
+    import bpy
+    scene = bpy.context.scene
+    scene.use_nodes = True
+    tree = scene.node_tree
+    # Ensure basic nodes exist
+    has_rl = any(n.type == 'R_LAYERS' for n in tree.nodes)
+    has_comp = any(n.type == 'COMPOSITE' for n in tree.nodes)
+    if not has_rl:
+        rl = tree.nodes.new('CompositorNodeRLayers')
+        rl.location = (0, 0)
+    if not has_comp:
+        comp = tree.nodes.new('CompositorNodeComposite')
+        comp.location = (800, 0)
+    return tree
+
+
+def add_compositor_node(node_type, name=None, location=None, **kwargs):
+    """Add a node to the compositor tree.
+
+    node_type: Blender compositor node type or shorthand alias:
+      'glare', 'blur', 'bright_contrast', 'hue_sat', 'color_balance',
+      'mix', 'alpha_over', 'lens_distortion', 'denoise', 'viewer',
+      'ellipse_mask', 'box_mask', 'split_viewer', 'map_value',
+      'math', 'separate_rgba', 'combine_rgba', 'rgb_curves',
+      'defocus', 'directional_blur', 'invert', 'filter',
+      'map_range', 'normalize', 'tonemap', 'file_output',
+      'switch', 'translate', 'scale', 'rotate', 'flip',
+      'crop', 'stabilize', 'keying', 'keying_screen',
+      'color_correction', 'exposure'
+
+    Example:
+        glare = add_compositor_node('glare', name='Bloom')
+        set_node_input(glare, 'Threshold', 0.8)
+        set_node_property(glare, 'glare_type', 'FOG_GLOW')
+    """
+    _COMP_ALIASES = {
+        'render_layers': 'CompositorNodeRLayers',
+        'composite': 'CompositorNodeComposite',
+        'viewer': 'CompositorNodeViewer',
+        'split_viewer': 'CompositorNodeSplitViewer',
+        'glare': 'CompositorNodeGlare',
+        'blur': 'CompositorNodeBlur',
+        'bright_contrast': 'CompositorNodeBrightContrast',
+        'hue_sat': 'CompositorNodeHueSat',
+        'color_balance': 'CompositorNodeColorBalance',
+        'color_correction': 'CompositorNodeColorCorrection',
+        'mix': 'CompositorNodeMixRGB',
+        'alpha_over': 'CompositorNodeAlphaOver',
+        'lens_distortion': 'CompositorNodeLensdist',
+        'denoise': 'CompositorNodeDenoise',
+        'ellipse_mask': 'CompositorNodeEllipseMask',
+        'box_mask': 'CompositorNodeBoxMask',
+        'math': 'CompositorNodeMath',
+        'map_value': 'CompositorNodeMapValue',
+        'map_range': 'CompositorNodeMapRange',
+        'separate_rgba': 'CompositorNodeSepRGBA',
+        'combine_rgba': 'CompositorNodeCombRGBA',
+        'rgb_curves': 'CompositorNodeCurveRGB',
+        'defocus': 'CompositorNodeDefocus',
+        'directional_blur': 'CompositorNodeDBlur',
+        'invert': 'CompositorNodeInvert',
+        'filter': 'CompositorNodeFilter',
+        'normalize': 'CompositorNodeNormalize',
+        'tonemap': 'CompositorNodeTonemap',
+        'file_output': 'CompositorNodeOutputFile',
+        'switch': 'CompositorNodeSwitch',
+        'translate': 'CompositorNodeTranslate',
+        'scale': 'CompositorNodeScale',
+        'rotate': 'CompositorNodeRotate',
+        'flip': 'CompositorNodeFlip',
+        'crop': 'CompositorNodeCrop',
+        'stabilize': 'CompositorNodeStabilize',
+        'keying': 'CompositorNodeKeying',
+        'keying_screen': 'CompositorNodeKeyingScreen',
+        'exposure': 'CompositorNodeExposure',
+    }
+    tree = _ensure_compositor()
+    actual_type = _COMP_ALIASES.get(node_type.lower(), node_type)
+    node = tree.nodes.new(actual_type)
+    if name:
+        node.name = name
+        node.label = name
+    if location:
+        node.location = location
+    for key, val in kwargs.items():
+        if hasattr(node, key):
+            setattr(node, key, val)
+    return node
+
+
+def get_compositor_node(name):
+    """Get a compositor node by name.
+
+    Example: rl = get_compositor_node('Render Layers')
+    """
+    import bpy
+    tree = bpy.context.scene.node_tree
+    if not tree:
+        return None
+    node = tree.nodes.get(name)
+    if node:
+        return node
+    for n in tree.nodes:
+        if n.label == name or n.name == name:
+            return n
+        name_lower = name.lower().replace(' ', '').replace('_', '')
+        type_name = n.bl_label.lower().replace(' ', '').replace('_', '') if hasattr(n, 'bl_label') else ''
+        if type_name == name_lower:
+            return n
+    return None
+
+
+def connect_compositor_nodes(from_node, from_output, to_node, to_input):
+    """Connect two compositor nodes.
+
+    Nodes can be objects or name strings.
+
+    Example:
+        connect_compositor_nodes('Render Layers', 'Image', 'Bloom', 'Image')
+        connect_compositor_nodes('Bloom', 'Image', 'Composite', 'Image')
+    """
+    import bpy
+    tree = bpy.context.scene.node_tree
+    if not tree:
+        return {"error": "No compositor tree"}
+
+    if isinstance(from_node, str):
+        from_node = get_compositor_node(from_node)
+    if isinstance(to_node, str):
+        to_node = get_compositor_node(to_node)
+    if not from_node or not to_node:
+        return {"error": "Node not found"}
+
+    out_socket = None
+    for s in from_node.outputs:
+        if s.name.lower() == from_output.lower():
+            out_socket = s
+            break
+    if not out_socket:
+        out_socket = from_node.outputs.get(from_output)
+
+    in_socket = None
+    for s in to_node.inputs:
+        if s.name.lower() == to_input.lower():
+            in_socket = s
+            break
+    if not in_socket:
+        in_socket = to_node.inputs.get(to_input)
+
+    if not out_socket or not in_socket:
+        return {"error": "Socket not found"}
+
+    for lnk in list(tree.links):
+        if lnk.to_socket == in_socket:
+            tree.links.remove(lnk)
+
+    tree.links.new(out_socket, in_socket)
+    return {"linked": "{}.{} → {}.{}".format(
+        from_node.name, out_socket.name, to_node.name, in_socket.name)}
+
+
+def remove_compositor_node(node):
+    """Remove a node from the compositor.
+
+    Example: remove_compositor_node('OldGlare')
+    """
+    import bpy
+    tree = bpy.context.scene.node_tree
+    if not tree:
+        return {"error": "No compositor tree"}
+    if isinstance(node, str):
+        node = get_compositor_node(node)
+    if not node:
+        return {"error": "Node not found"}
+    name = node.name
+    tree.nodes.remove(node)
+    return {"removed": name}
+
+
+def auto_arrange_compositor():
+    """Auto-arrange all compositor nodes in a clean horizontal layout.
+
+    Example: auto_arrange_compositor()
+    """
+    import bpy
+    tree = bpy.context.scene.node_tree
+    if not tree:
+        return {"error": "No compositor tree"}
+    _auto_arrange_tree(tree)
+    return {"arranged": len(tree.nodes)}
+
+
+def clear_compositor():
+    """Clear all compositor nodes and set up fresh Render Layers → Composite.
+
+    Example: clear_compositor()
+    """
+    tree = _ensure_compositor()
+    tree.nodes.clear()
+    rl = tree.nodes.new('CompositorNodeRLayers')
+    rl.location = (0, 0)
+    comp = tree.nodes.new('CompositorNodeComposite')
+    comp.location = (400, 0)
+    tree.links.new(rl.outputs['Image'], comp.inputs['Image'])
+    return {"compositor": "reset"}
+
+
+def add_viewer_node():
+    """Add a Viewer node to the compositor for preview.
+
+    Example: add_viewer_node()
+    """
+    tree = _ensure_compositor()
+    viewer = tree.nodes.new('CompositorNodeViewer')
+    viewer.location = (800, -200)
+    # Connect from last node before composite
+    comp = None
+    for n in tree.nodes:
+        if n.type == 'COMPOSITE':
+            comp = n
+            break
+    if comp:
+        for lnk in tree.links:
+            if lnk.to_node == comp and lnk.to_socket.name == 'Image':
+                tree.links.new(lnk.from_socket, viewer.inputs['Image'])
+                break
+    return {"viewer": "added"}
+
+
+def insert_compositor_node_between(new_node_type, before_node, after_node,
+                                   socket_name='Image', **kwargs):
+    """Insert a new compositor node between two existing nodes.
+
+    Automatically re-links the chain. Useful for adding effects inline.
+
+    Example:
+        insert_compositor_node_between('glare', 'Render Layers', 'Composite')
+    """
+    import bpy
+    tree = bpy.context.scene.node_tree
+    if not tree:
+        return {"error": "No compositor tree"}
+
+    if isinstance(before_node, str):
+        before_node = get_compositor_node(before_node)
+    if isinstance(after_node, str):
+        after_node = get_compositor_node(after_node)
+    if not before_node or not after_node:
+        return {"error": "Node not found"}
+
+    # Find the link between them
+    target_link = None
+    for lnk in tree.links:
+        if lnk.from_node == before_node and lnk.to_node == after_node:
+            target_link = lnk
+            break
+    if not target_link:
+        return {"error": "No direct link between these nodes"}
+
+    out_socket = target_link.from_socket
+    in_socket = target_link.to_socket
+
+    # Create the new node
+    new_node = add_compositor_node(new_node_type, **kwargs)
+    tree.links.remove(target_link)
+
+    # Find matching sockets on new node
+    new_in = None
+    for s in new_node.inputs:
+        if s.name == socket_name or s.type == out_socket.type:
+            new_in = s
+            break
+    if not new_in:
+        new_in = new_node.inputs[0]
+
+    new_out = None
+    for s in new_node.outputs:
+        if s.name == socket_name or s.type == in_socket.type:
+            new_out = s
+            break
+    if not new_out:
+        new_out = new_node.outputs[0]
+
+    tree.links.new(out_socket, new_in)
+    tree.links.new(new_out, in_socket)
+
+    _auto_arrange_tree(tree)
+    return {"inserted": new_node.name,
+            "chain": "{} → {} → {}".format(
+                before_node.name, new_node.name, after_node.name)}

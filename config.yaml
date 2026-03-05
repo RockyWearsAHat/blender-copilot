@@ -8,7 +8,7 @@ project:
 
 scraping:
   output_dir: data/raw
-  max_file_size_mb: 200 # Skip .blend files larger than this
+  max_file_size_mb: 5000 # Production default: do not discard detailed assets by size
   respect_rate_limits: true
   user_agent: "BlenderModelTraining/0.1 (research; open-source)"
 
@@ -46,18 +46,24 @@ scraping:
 
   youtube:
     enabled: true
+    # Channel-based scraping (default mode)
+    # Channels are defined in scrapers/youtube_scraper.py CURATED_CHANNELS
+    max_tier: 2 # Scrape tier 1 + 2 by default (skip tier 3)
+    max_per_channel: 200
+    download_blends: true # Download blends when available (skip templates)
+    extract_transcripts: true
+
+    # Extra channels not in the built-in list (handle, name, tier, specialty)
+    extra_channels: []
+
+    # Legacy keyword search (used with --legacy-search flag)
     search_queries:
       - "blender modeling tutorial"
-      - "blender character modeling"
-      - "blender vehicle modeling"
-      - "blender architecture tutorial"
       - "blender hard surface modeling"
       - "blender sculpting tutorial"
-      - "blender lamborghini modeling tutorial"
-      - "blender architecture modeling with files"
-      - "how to make a house in blender with files"
-    max_videos_per_query: 500
-    extract_transcripts: true
+      - "blender geometry nodes tutorial"
+      - "blender materials tutorial"
+    max_videos_per_query: 100
 
 # ── Data Processing ──────────────────────────────────────────────────────
 
@@ -67,7 +73,7 @@ processing:
 
   mesh_extraction:
     min_vertices: 8 # Skip trivially simple meshes
-    max_vertices: 100000 # Skip overly complex meshes
+    max_vertices: 5000000 # Production default: preserve high-detail meshes
     coordinate_precision: 4 # Decimal places for vertex coords
     normalize: true # Center and scale to unit sphere
 
@@ -86,14 +92,34 @@ processing:
     deduplicate: true
     dedup_similarity_threshold: 0.95
 
+# ── Data Paths ───────────────────────────────────────────────────────────
+# Central registry of all data paths. Training, eval, and scripts all
+# read from here so there is ONE source of truth.
+
+data:
+  geometry_dir: data/datasets/geometry
+  materials_train: data/datasets/geometry/materials_train.jsonl
+  modifiers_train: data/datasets/geometry/modifiers_train.jsonl
+  real_mesh_dirs:
+    - data/processed/objaverse
+    - data/processed/blendswap
+    - data/processed/blender_official
+    - data/processed/smutbase
+    - data/processed/github
+    - data/processed/open3dlab
+    - data/processed/youtube
+  cache_dir: data/processed/.mesh_cache
+  eval_dir: data/eval
+  renders_dir: data/renders
+
 # ── Mesh Tokenization ────────────────────────────────────────────────────
 
 tokenization:
   # MeshGPT-style face tokenization
   vocab_size: 8192 # Number of quantized coordinate tokens
   coordinate_range: [-1.0, 1.0] # After normalization
-  max_faces: 2048 # Max faces per training example
-  max_vertices: 4096 # Max vertices per training example
+  max_faces: 8000 # High-detail training budget (H100 80GB)
+  max_vertices: 16384 # Max vertices per training example
   face_ordering: "z_curve" # Spatial ordering for faces: z_curve, hilbert, random
 
   # Sequence format: each face = [v1x, v1y, v1z, v2x, v2y, v2z, v3x, v3y, v3z]
@@ -102,28 +128,54 @@ tokenization:
 
 # ── Model Configuration ──────────────────────────────────────────────────
 
-models:
+# The 'unified' key is what the actual training code reads.
+# Uses RoPE (no fixed max length) + gradient checkpointing on MPS.
+# batch_size=1 + grad_accum=8 on MPS for long sequence support.
+unified:
+  embed_dim: 1024
+  text_vocab_size: 8000
+  text_max_length: 256
+  text_num_layers: 4
+  text_num_heads: 16
+  dropout: 0.1
+
+  # Feature flags — disable optional heads on constrained hardware.
+  # On a laptop (MPS, 36 GB), set all three false to save ~15M params
+  # of GPU memory, leaving more room for long geometry sequences.
+  # Turn them on when training on a GPU server with >=24 GB VRAM.
+  enable_materials: true
+  enable_modifiers: true
+  # Contrastive: aligns rendered images with text descriptions (CLIP-style).
+  # Required for image-to-mesh. Uses ~1M extra params, ~2 GB VRAM.
+  # Enable on any machine with >=16 GB RAM/VRAM.
+  enable_contrastive: true
+  # Image-to-mesh: conditions geometry decoder on spatial image features.
+  # Requires enable_contrastive=true. Adds 16 cross-attention tokens.
+  # Enable to train the model to reconstruct 3D from rendered images.
+  enable_image_to_mesh: true
+
+  # Image encoder settings
+  image_size: 64 # Input render resolution (64x64 is fast + sufficient)
+  image_num_views: 4 # Multi-view renders per training example
+
   geometry:
-    architecture: "transformer"
-    hidden_size: 1024
-    num_layers: 24
+    num_layers: 16
     num_heads: 16
-    vocab_size: 8192 # Matches tokenization.vocab_size
-    max_sequence_length: 18432 # max_faces * 9 tokens per tri face
-    dropout: 0.1
+    mesh_vocab_size: 8192
+    # 8000 faces × 9 tokens + 2 (BOS/EOS) = 72002
+    # H100 80GB: gradient checkpointing + mixed precision
+    # M3 inference: CPU mode with lower max_faces (capped to 900 in code)
+    max_seq_length: 72002
 
   materials:
-    architecture: "transformer"
-    hidden_size: 512
-    num_layers: 12
+    num_layers: 6
     num_heads: 8
-    max_nodes: 50
+    hidden_size: 256
+    max_seq_len: 512
+    vocab_size: 4096
 
   modifiers:
-    architecture: "transformer"
     hidden_size: 256
-    num_layers: 6
-    num_heads: 4
 
 # ── Training ─────────────────────────────────────────────────────────────
 
@@ -132,7 +184,7 @@ training:
   learning_rate: 1.0e-4
   weight_decay: 0.01
   warmup_steps: 1000
-  max_steps: 100000
+  max_steps: 150000
   eval_every: 1000
   save_every: 5000
   gradient_accumulation_steps: 4
@@ -164,3 +216,41 @@ inference:
     merge_by_distance: 0.0001
     recalculate_normals: true
     smooth_shade: true
+
+# ── RLHF — Human Feedback Training ──────────────────────────────────────
+
+rlhf:
+  enabled: true
+
+  # DPO (Direct Preference Optimization)
+  dpo_beta: 0.1 # KL penalty (higher = more conservative updates)
+  dpo_lr: 1.0e-5 # Learning rate for DPO policy updates
+  dpo_steps_per_update: 5 # DPO gradient steps per feedback batch
+  kl_penalty: 0.01 # Additional KL divergence penalty weight
+
+  # Feedback collection
+  feedback_path: "data/feedback/feedback_buffer.jsonl"
+  feedback_max_size: 10000 # Max stored feedback items
+  feedback_batch_trigger: 20 # Train reward model after N new items
+  feedback_time_trigger: 60 # Or after N seconds since last train
+
+  # Reward model
+  reward_hidden_dim: 256
+  reward_dropout: 0.1
+  reward_lr: 3.0e-4
+  reward_epochs: 3 # Training epochs per burst
+  reward_checkpoint: "checkpoints/reward/latest.pt"
+
+  # Active query selection
+  n_candidates: 4 # Candidates to generate for A/B comparison
+  uncertainty_strategy: "disagreement" # disagreement, margin, random
+  mc_dropout_passes: 10 # MC Dropout forward passes for uncertainty
+
+  # Evaluation dashboard
+  eval_scenarios_path: "data/eval/scenarios.jsonl"
+  eval_results_path: "data/eval/results.jsonl"
+  eval_every_updates: 10 # Run eval dashboard every N RLHF updates
+
+  # Sequence limits
+  max_text_length: 256
+  max_mesh_length: 72002 # 8000 faces × 9 tokens + 2 for BOS/EOS

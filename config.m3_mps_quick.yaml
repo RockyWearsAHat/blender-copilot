@@ -1,0 +1,245 @@
+# M3 / Apple Silicon (MPS) quick-train profile
+# Goal: visible geometry improvement in ~1–3 hours, avoid swap/OOM.
+# This keeps *geometry-only* training by disabling optional heads/tasks.
+#
+# Notes:
+# - MPS is O(n^2) attention memory; keep geometry sequences short.
+# - Geometry tokens = 9 * max_faces + 2 (BOS/EOS) in current face-token format.
+# - training/train_unified.py already enforces an MPS guard at 900 faces (8102 tokens).
+
+project:
+  name: BlenderModelTraining
+  version: 0.1.0
+
+# ── Data Collection ──────────────────────────────────────────────────────
+scraping:
+  output_dir: data/raw
+  max_file_size_mb: 5000
+  respect_rate_limits: true
+  user_agent: "BlenderModelTraining/0.1 (research; open-source)"
+
+  blendswap:
+    enabled: true
+    base_url: "https://www.blendswap.com"
+    licenses: ["CC-0", "CC-BY"]
+    categories:
+      [
+        "characters",
+        "vehicles",
+        "architecture",
+        "furniture",
+        "nature",
+        "electronics",
+        "animals",
+        "objects",
+        "interior",
+        "exterior",
+        "mechanical",
+        "sci-fi",
+      ]
+    max_pages_per_category: 50
+
+  objaverse:
+    enabled: true
+    max_models: 50000
+    categories: null
+
+  github:
+    enabled: true
+    search_query: "extension:blend"
+    licenses: ["mit", "apache-2.0", "cc0-1.0", "cc-by-4.0"]
+    max_repos: 5000
+
+  youtube:
+    enabled: true
+    max_tier: 2
+    max_per_channel: 200
+    download_blends: true
+    extract_transcripts: true
+    extra_channels: []
+    search_queries:
+      - "blender modeling tutorial"
+      - "blender hard surface modeling"
+      - "blender sculpting tutorial"
+      - "blender geometry nodes tutorial"
+      - "blender materials tutorial"
+    max_videos_per_query: 100
+
+# ── Data Processing ──────────────────────────────────────────────────────
+processing:
+  blender_executable: "blender"
+  output_dir: data/processed
+
+  mesh_extraction:
+    min_vertices: 8
+    max_vertices: 5000000
+    coordinate_precision: 4
+    normalize: true
+
+  material_extraction:
+    include_node_trees: true
+    include_textures: false
+    max_nodes_per_material: 50
+
+  modifier_extraction:
+    include_applied: false
+
+  quality_filter:
+    min_faces: 12
+    max_non_manifold_ratio: 0.1
+    require_materials: false
+    deduplicate: true
+    dedup_similarity_threshold: 0.95
+
+# ── Data Paths ───────────────────────────────────────────────────────────
+data:
+  geometry_dir: data/datasets/geometry
+  materials_train: data/datasets/geometry/materials_train.jsonl
+  modifiers_train: data/datasets/geometry/modifiers_train.jsonl
+  real_mesh_dirs:
+    - data/processed/objaverse
+    - data/processed/blendswap
+    - data/processed/blender_official
+    - data/processed/smutbase
+    - data/processed/github
+    - data/processed/open3dlab
+    - data/processed/youtube
+  cache_dir: data/processed/.mesh_cache
+  eval_dir: data/eval
+  renders_dir: data/renders
+
+# ── Mesh Tokenization ────────────────────────────────────────────────────
+tokenization:
+  vocab_size: 8192
+  coordinate_range: [-1.0, 1.0]
+
+  # Keep sequences short on MPS to avoid OOM/swap.
+  # 512 faces → max_seq_length = 512*9 + 2 = 4610 tokens.
+  max_faces: 512
+
+  max_vertices: 16384
+  face_ordering: "z_curve"
+  triangulate: true
+
+# ── Model Configuration (Geometry-only) ──────────────────────────────────
+unified:
+  # Smaller model = faster iteration + less memory.
+  # 512 with 6–8 layers tends to be a good sweet spot for MPS.
+  embed_dim: 512
+
+  text_vocab_size: 8000
+  text_max_length: 192
+  text_num_layers: 3
+  text_num_heads: 8
+  dropout: 0.1
+
+  # Geometry-only: disable optional heads to save params + memory + time.
+  enable_materials: false
+  enable_modifiers: false
+  enable_contrastive: false
+  enable_image_to_mesh: false
+
+  # Even though contrastive is disabled, synthetic stream may still render
+  # a small fraction of images internally; keep them tiny to reduce overhead.
+  image_size: 32
+  image_num_views: 1
+
+  geometry:
+    num_layers: 6
+    num_heads: 8
+    mesh_vocab_size: 8192
+    max_seq_length: 4610
+
+  materials:
+    num_layers: 6
+    num_heads: 8
+    hidden_size: 256
+    max_seq_len: 512
+    vocab_size: 4096
+
+  modifiers:
+    hidden_size: 256
+
+# ── Training ─────────────────────────────────────────────────────────────
+training:
+  # MPS: set batch_size=1 and use grad accumulation for effective batch.
+  # train_unified.py will force batch_size=1 anyway if you set it higher.
+  batch_size: 1
+  gradient_accumulation_steps: 16
+
+  # Stability-first on MPS: keep fp32 until loss is well-behaved.
+  # If stable and you want speed, switch to "fp16" (will autocast to bf16 on MPS).
+  mixed_precision: "fp32"
+
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 200
+
+  # You’ll usually stop manually in 1–3 hours; this is just an upper bound.
+  max_steps: 30000
+
+  # Cadence tuned for quick feedback without constant I/O.
+  eval_every: 500
+  save_every: 1000
+
+  optimizer: "adamw"
+  scheduler: "cosine"
+
+  # Explicitly geometry-only tasks.
+  task_weights:
+    geometry: 6.0
+    real_geometry: 4.0
+    materials: 0.0
+    modifiers: 0.0
+    contrastive: 0.0
+    image_geometry: 0.0
+
+  augmentation:
+    random_rotation: true
+    random_scale: [0.9, 1.1]
+    random_flip: true
+    noise_std: 0.001
+
+# ── Inference ────────────────────────────────────────────────────────────
+inference:
+  server_port: 8420
+  device: "auto"
+  max_generation_time_seconds: 30
+  quantization: null
+
+  postprocess:
+    remove_degenerate_faces: true
+    merge_by_distance: 0.0001
+    recalculate_normals: true
+    smooth_shade: true
+
+# ── RLHF — disable for quick geometry-only iteration ─────────────────────
+rlhf:
+  enabled: false
+
+  dpo_beta: 0.1
+  dpo_lr: 1.0e-5
+  dpo_steps_per_update: 5
+  kl_penalty: 0.01
+
+  feedback_path: "data/feedback/feedback_buffer.jsonl"
+  feedback_max_size: 10000
+  feedback_batch_trigger: 20
+  feedback_time_trigger: 60
+
+  reward_hidden_dim: 256
+  reward_dropout: 0.1
+  reward_lr: 3.0e-4
+  reward_epochs: 3
+  reward_checkpoint: "checkpoints/reward/latest.pt"
+
+  n_candidates: 4
+  uncertainty_strategy: "disagreement"
+  mc_dropout_passes: 10
+
+  eval_scenarios_path: "data/eval/scenarios.jsonl"
+  eval_results_path: "data/eval/results.jsonl"
+  eval_every_updates: 10
+
+  max_text_length: 192
+  max_mesh_length: 4610

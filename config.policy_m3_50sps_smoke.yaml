@@ -1,0 +1,42 @@
+# M3/MPS throughput config aiming for 50+ training steps/sec (logged).
+# This reduces seq_len and batch_size so each optimizer step is lighter.
+
+data:
+  seed: 0
+  seq_len: 16
+  batch_size: 16
+
+  mask_numeric_goal_prob: 0.7
+
+  goal_source:
+    type: geometry_jsonl
+    path: data/datasets/geometry/train.jsonl
+    max_records: 5000
+
+  collapse_trace_source:
+    path: data/datasets/collapse_traces
+    mix_prob: 0.3
+    max_traces: 5000
+
+model:
+  state_dim: 28
+  hidden_size: 128
+  num_layers: 2
+  num_heads: 4
+  dropout: 0.1
+  action_type_vocab: 12
+  action_param_vocab: 32
+  max_seq_len: 32
+
+training:
+  checkpoint_dir: checkpoints/policy_goal_50sps_smoke
+  max_steps: 2000
+  log_every: 20
+  save_every: 200
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  mixed_precision: fp16
+
+  noop_pred_penalty: 0.05
+  noop_action_index: 11

@@ -11,14 +11,157 @@ Architecture (v4 — lean single-pass copilot):
 """
 
 import json
+import logging
 import re
 import os
 import base64
 import urllib.request
 import urllib.error
+import urllib.parse
 import ssl
 import tempfile
+import threading
+import queue
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Local Mesh Server Detection
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _is_local_mesh_server(server_url: str) -> bool:
+    """Check if server is our local mesh generation server."""
+    return "127.0.0.1" in server_url or "localhost" in server_url
+
+
+def _generate_mesh_local(server_url: str, prompt: str, temperature: float = 0.8,
+                         timeout: int = 60, max_faces: int = 512,
+                         top_k: int = 96, top_p: float = 0.97,
+                         cfg_scale: float = 1.5) -> dict:
+    """Call local mesh generation server directly.
+    
+    Parameters:
+    - prompt: text description of what to generate
+    - temperature: sampling temperature (higher = more creative/random)
+    - timeout: max seconds to wait for generation
+    - max_faces: maximum faces to generate (capped server-side to model capacity)
+    """
+    def _post(payload_dict: dict) -> dict:
+        data = json.dumps(payload_dict).encode("utf-8")
+        req = urllib.request.Request(
+            f"{server_url}/generate/mesh",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    payload = {
+        "prompt": prompt,
+        "temperature": float(temperature),
+        "max_faces": int(max_faces),
+        "top_k": int(top_k),
+        "top_p": float(top_p),
+        "cfg_scale": float(cfg_scale),
+    }
+    result = _post(payload)
+
+    err = str(result.get("error", "")).lower() if isinstance(result, dict) else ""
+    if "trivial primitive" in err or "collapsed" in err:
+        retry_payload = dict(payload)
+        retry_payload["temperature"] = max(float(temperature), 0.9)
+        retry_payload["top_k"] = max(int(top_k), 96)
+        retry_payload["top_p"] = max(float(top_p), 0.97)
+        retry_payload["cfg_scale"] = min(float(cfg_scale), 1.5)
+        retry_payload["max_faces"] = min(int(max_faces), 192)
+        result = _post(retry_payload)
+
+    return result
+
+
+def _mesh_to_code(mesh_data: dict) -> str:
+    """Convert mesh generation result to executable Blender code."""
+    if not mesh_data.get("objects"):
+        return "# No mesh generated"
+    
+    obj_data = mesh_data["objects"][0]
+    mesh_info = obj_data["mesh"]
+    name = obj_data["name"]
+    vertices = mesh_info["vertices"]
+    faces = mesh_info["faces"]
+    
+    # Generate Python code to create the mesh
+    code_lines = [
+        "import bpy",
+        "import bmesh",
+        "from mathutils import Vector",
+        "",
+        f"# Generated mesh: {name}",
+        f"# {len(vertices)} vertices, {len(faces)} faces",
+        "",
+        "# Create mesh and object",
+        "mesh = bpy.data.meshes.new(name='{}')" .format(name),
+        "obj = bpy.data.objects.new(name='{}', object_data=mesh)".format(name),
+        "bpy.context.collection.objects.link(obj)",
+        "",
+        "# Create mesh data",
+        "bm = bmesh.new()",
+        "",
+        "# Add vertices",
+        "verts = []",
+    ]
+    
+    # Add vertices in batches to avoid huge single lines
+    for i in range(0, len(vertices), 10):
+        batch = vertices[i:i+10]
+        for v in batch:
+            code_lines.append(f"verts.append(bm.verts.new(({v[0]:.4f}, {v[1]:.4f}, {v[2]:.4f})))")
+    
+    code_lines.extend([
+        "",
+        "bm.verts.ensure_lookup_table()",
+        "",
+        "# Add faces",
+    ])
+    
+    # Add faces (skip duplicates)
+    code_lines.append("_seen_faces = set()")
+    for face in faces:
+        v_refs = ", ".join(f"verts[{vi}]" for vi in face)
+        face_key = tuple(sorted(face))
+        code_lines.append(f"_fk = {face_key}")
+        code_lines.append("if _fk not in _seen_faces:")
+        code_lines.append("    _seen_faces.add(_fk)")
+        code_lines.append("    try:")
+        code_lines.append(f"        bm.faces.new([{v_refs}])")
+        code_lines.append("    except ValueError:")
+        code_lines.append("        pass")
+    
+    code_lines.extend([
+        "",
+        "# Update mesh and clean up",
+        "bm.to_mesh(mesh)",
+        "bm.free()",
+        "mesh.update()",
+        "",
+        "# Center geometry at origin",
+        "bpy.ops.object.select_all(action='DESELECT')",
+        "obj.select_set(True)",
+        "bpy.context.view_layer.objects.active = obj",
+        "bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='MEDIAN')",
+        "obj.location = (0, 0, 0)",
+        "",
+        "# Shade smooth",
+        "for face in mesh.polygons:",
+        "    face.use_smooth = True",
+    ])
+    
+    return "\n".join(code_lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -29,14 +172,14 @@ _conversation = []   # list of {"role": "user"/"assistant", "content": str}
 MAX_HISTORY = 30     # keep last N messages to limit token usage
 
 # ── Chat logging ──────────────────────────────────────────────────────
-_CHAT_LOG_DIR = "/Users/alexwaldmann/blenderPlugins/AIHouseGenerator/chat_logs"
+_CHAT_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "chat_logs")
 _chat_session_id = None  # set on first message, reset on clear
 
 # ── Session generation counter — bumped on every clear_history() ──────
 # Background threads capture this at start; if it changes before they
 # finish, their writes to _conversation are silently discarded.
 _session_generation = 0
-_state_lock = _threading.Lock()   # guards _conversation, _iteration_history, _session_generation
+_state_lock = threading.Lock()   # guards _conversation, _iteration_history, _session_generation
 
 # ── Streaming state (updated by background thread, read by UI) ────────
 _streaming_text = ""   # partial response text during streaming
@@ -61,19 +204,16 @@ _message_seq = 0
 # Main-Thread Dispatch  (background threads request bpy.context work here)
 # ═══════════════════════════════════════════════════════════════════════════
 
-import threading as _threading
-import queue as _queue
-
-_main_thread_queue = _queue.Queue()
+_main_thread_queue = queue.Queue()
 
 
 def _run_on_main_thread(fn):
     """Execute *fn* on the main thread and return its result."""
-    if _threading.current_thread() is _threading.main_thread():
+    if threading.current_thread() is threading.main_thread():
         return fn()
 
-    result_holder = [None, None]
-    event = _threading.Event()
+    result_holder: list = [None, None]
+    event = threading.Event()
 
     def _wrapper():
         try:
@@ -96,10 +236,39 @@ def process_main_thread_queue():
         try:
             fn = _main_thread_queue.get_nowait()
             fn()
-        except _queue.Empty:
+        except queue.Empty:
             break
         except Exception:
             pass
+
+
+def flush_main_thread_queue():
+    """Discard all pending items in the main-thread queue.
+
+    Call this when stopping a generation to prevent stale code from
+    a previous session executing after a new prompt starts.
+    Each discarded wrapper's event is set so blocked background threads
+    unblock instead of hanging for 30 seconds.
+    """
+    discarded = 0
+    while True:
+        try:
+            fn = _main_thread_queue.get_nowait()
+            # Try to set the event so any blocked background thread unblocks
+            try:
+                if hasattr(fn, '__closure__') and fn.__closure__:
+                    for cell in fn.__closure__:
+                        obj = cell.cell_contents
+                        if isinstance(obj, threading.Event):
+                            obj.set()
+                            break
+            except (ValueError, AttributeError):
+                pass
+            discarded += 1
+        except queue.Empty:
+            break
+    if discarded:
+        print(f"[Blender Copilot] Flushed {discarded} stale queue items")
 
 
 def get_session_generation():
@@ -254,7 +423,15 @@ def clear_history():
     global _chat_session_id, _message_seq, _session_generation
     _save_chat_log()   # persist before clearing
     with _state_lock:
+        old_gen = _session_generation
         _session_generation += 1   # invalidate all in-flight background threads
+        import traceback as _tb
+        caller = _tb.extract_stack(limit=3)
+        caller_info = " → ".join(
+            "%s:%d:%s" % (f.filename.split("/")[-1], f.lineno, f.name)
+            for f in caller[:-1])
+        print("[Blender Copilot] clear_history: session_gen %d → %d  caller: %s"
+              % (old_gen, _session_generation, caller_info))
         _conversation.clear()
         _iteration_history.clear()
         _finalized_iterations.clear()
@@ -462,7 +639,6 @@ def _material_list():
 
 def _get_viewport_center_and_radius():
     import bpy  # type: ignore
-    from mathutils import Vector  # type: ignore
     for area in bpy.context.screen.areas:
         if area.type != 'VIEW_3D':
             continue
@@ -720,7 +896,8 @@ def _get_tools_reference():
             if not args.vararg:
                 params.append("*")
             for j, kw in enumerate(args.kwonlyargs):
-                kwd = _ast.unparse(args.kw_defaults[j]) if args.kw_defaults[j] else ""
+                _default = args.kw_defaults[j]
+                kwd = _ast.unparse(_default) if _default is not None else ""
                 params.append(kw.arg + ("=" + kwd if kwd else ""))
         if args.kwarg:
             params.append("**" + args.kwarg.arg)
@@ -731,6 +908,39 @@ def _get_tools_reference():
             lines.append(sig + "  # " + first)
         else:
             lines.append(sig)
+
+    # Also include procedural materials from materials.py
+    mat_path = os.path.join(os.path.dirname(__file__), "materials.py")
+    try:
+        with open(mat_path, "r") as f:
+            mat_tree = _ast.parse(f.read())
+        lines.append("")
+        lines.append("# Procedural PBR materials (also pre-imported):")
+        for node in _ast.iter_child_nodes(mat_tree):
+            if not isinstance(node, _ast.FunctionDef):
+                continue
+            if node.name.startswith('_'):
+                continue
+            args = node.args
+            params = []
+            defaults_offset = len(args.args) - len(args.defaults)
+            for i, arg in enumerate(args.args):
+                name = arg.arg
+                didx = i - defaults_offset
+                if didx >= 0:
+                    params.append(name + "=" + _ast.unparse(args.defaults[didx]))
+                else:
+                    params.append(name)
+            sig = node.name + "(" + ", ".join(params) + ")"
+            doc = _ast.get_docstring(node) or ""
+            first = doc.split("\n")[0].strip() if doc else ""
+            if first:
+                lines.append(sig + "  # " + first)
+            else:
+                lines.append(sig)
+    except Exception:
+        pass
+
     return "\n".join(lines)
 
 
@@ -797,6 +1007,12 @@ along BOTH X and Y axes, with LENGTH_AXIS auto-detected.
 3. CLEAN WORKFLOW
    • Reuse existing materials: find_material("Name") or quick_material().
    • Different surfaces get different materials — no grey defaults.
+   • For multi-part objects: use assign_material() on each separate object.
+   • For single-mesh objects with multiple surfaces: use assign_material_to_faces()
+     or assign_material_by_normal() to apply different materials to different faces.
+   • Procedural PBR materials available: make_wood(), make_brick(), make_concrete(),
+     make_stone(), make_metal(), make_stucco(), make_grass(), make_glass().
+   • quick_material() accepts hex colors: quick_material("Wood", color="#8B4513").
    • Organize into semantic collections with new_collection() + link_to_collection().
    • merge_by_distance() after booleans. recalc_normals() for clean mesh.
    • apply_transforms() before booleans.
@@ -1174,6 +1390,15 @@ measurable progress or you should declare COMPLETE.
       limited_dissolve() + flat_shade().
     - Detailed/realistic = smooth_shade() + shade_auto_smooth(angle=30).
   • Material variety — different surfaces get different materials.
+    For generated meshes (single object): use assign_material_to_faces()
+    or assign_material_by_normal() to apply different materials to
+    different regions (top, sides, bottom).
+    Example workflow for a generated fruit bowl:
+      bowl = get("FruitBowl")
+      clay = make_stucco("Clay", color=(0.85, 0.7, 0.5))
+      glaze = quick_material("Glaze", color=(0.9, 0.85, 0.75), roughness=0.2)
+      assign_material(bowl, clay)  # base material for all faces
+      assign_material_by_normal(bowl, glaze, axis='Z', direction='UP', threshold=0.6)
   • No floating geometry — everything connects or sits properly.
   • Clean topology — merge_by_distance(), recalc_normals().
 
@@ -1305,7 +1530,7 @@ def _build_system_prompt():
 # HTTP / OpenAI helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _http_post(url, headers, payload, timeout=180):
+def _http_post(url, headers, payload, timeout=None):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     ctx = ssl.create_default_context()
@@ -1313,17 +1538,24 @@ def _http_post(url, headers, payload, timeout=180):
         with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
             body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
+        # HTTPError is a subclass of URLError — must catch it FIRST
         err = e.read().decode("utf-8") if e.fp else ""
         raise RuntimeError("API error %d: %s" % (e.code, err[:500])) from e
+    except urllib.error.URLError as e:
+        if "Connection refused" in str(e) or "No connection" in str(e):
+            raise RuntimeError(
+                "Cannot connect to LLM server. "
+                "Make sure ollama is running: ollama serve"
+            ) from e
+        raise RuntimeError("Connection error: %s" % str(e)[:300]) from e
     return json.loads(body)
 
 
-def _chat(api_key, model, messages, temperature=0.7, max_tokens=16384, on_chunk=None):
+def _chat(server_url, model, messages, temperature=0.7, max_tokens=16384, on_chunk=None):
     if on_chunk is not None:
-        return _chat_stream(api_key, model, messages, temperature,
+        return _chat_stream(server_url, model, messages, temperature,
                             max_tokens, on_chunk)
 
-    api_key = api_key.strip()
     _model_lower = model.lower()
     _is_reasoning = _model_lower.startswith(("o1", "o3", "o4"))
 
@@ -1338,19 +1570,17 @@ def _chat(api_key, model, messages, temperature=0.7, max_tokens=16384, on_chunk=
         payload["max_completion_tokens"] = max_tokens
 
     result = _http_post(
-        "https://api.openai.com/v1/chat/completions",
+        f"{server_url}/v1/chat/completions",
         {
             "Content-Type": "application/json",
-            "Authorization": "Bearer %s" % api_key,
         },
         payload,
     )
     return result["choices"][0]["message"]["content"]
 
 
-def _chat_stream(api_key, model, messages, temperature=0.7,
+def _chat_stream(server_url, model, messages, temperature=0.7,
                  max_tokens=16384, on_chunk=None):
-    api_key = api_key.strip()
     _model_lower = model.lower()
     _is_reasoning = _model_lower.startswith(("o1", "o3", "o4"))
 
@@ -1367,11 +1597,10 @@ def _chat_stream(api_key, model, messages, temperature=0.7,
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
+        f"{server_url}/v1/chat/completions",
         data=data,
         headers={
             "Content-Type": "application/json",
-            "Authorization": "Bearer %s" % api_key,
         },
         method="POST",
     )
@@ -1379,7 +1608,7 @@ def _chat_stream(api_key, model, messages, temperature=0.7,
 
     full_text = ""
     try:
-        with urllib.request.urlopen(req, context=ctx, timeout=180) as resp:
+        with urllib.request.urlopen(req, context=ctx) as resp:
             while True:
                 raw_line = resp.readline()
                 if not raw_line:
@@ -1411,54 +1640,391 @@ def _chat_stream(api_key, model, messages, temperature=0.7,
 # Tool-Calling API — structured tool use (VS Code Copilot-style)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _chat_with_tools(api_key, model, messages, tools, temperature=0.7,
+def _strip_special_tokens(text):
+    """Remove LLM chat template tokens from text output."""
+    if not text:
+        return text
+    # Qwen / ollama chat template markers
+    text = re.sub(r'<\|im_start\|>.*?\n?', '', text)
+    text = re.sub(r'<\|im_end\|>', '', text)
+    text = re.sub(r'<\|endoftext\|>', '', text)
+    text = re.sub(r'<\|im_sep\|>', '', text)
+    # Generic special tokens
+    text = re.sub(r'<\|[a-z_]+\|>', '', text)
+    return text.strip()
+
+
+# Models that have been detected as NOT supporting the structured
+# "tools" API parameter.  Cached per-session so we only pay the
+# cost of one failed request per model.
+_MODELS_WITHOUT_TOOLS_API: set = set()
+
+
+def _chat_with_tools(server_url, model, messages, tools, temperature=0.7,
                      max_tokens=16384, on_status=None):
-    """Call OpenAI chat API with tool definitions.
+    """Call chat API with tool definitions.
 
     Returns the full message dict (may contain tool_calls or content).
-    Non-streaming for simplicity — tool calls are usually fast.
-    """
-    api_key = api_key.strip()
-    _model_lower = model.lower()
-    _is_reasoning = _model_lower.startswith(("o1", "o3", "o4"))
+    Handles both structured tool_calls (OpenAI/ollama) and text-based
+    tool calls (common with vision models or older local LLMs).
 
+    If the model doesn't support the ``tools`` API parameter (e.g.
+    qwen2.5vl) the function automatically retries WITHOUT ``tools``
+    and relies on ``_parse_tool_calls_from_text`` to extract calls
+    from the model's plain-text output.  The result is cached so
+    subsequent rounds skip the failed attempt.
+    """
+    use_tools_api = model not in _MODELS_WITHOUT_TOOLS_API
+
+    # --- First attempt: with tools (if model supports it) ----------------
+    if use_tools_api:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "temperature": temperature,
+            "stream": False,
+        }
+        try:
+            result = _http_post(
+                f"{server_url}/v1/chat/completions",
+                {"Content-Type": "application/json"},
+                payload,
+            )
+            msg = result["choices"][0]["message"]
+
+            if msg.get("content"):
+                msg["content"] = _strip_special_tokens(msg["content"])
+
+            if msg.get("tool_calls"):
+                return msg
+
+            # Model responded but without structured tool_calls — parse text
+            content = msg.get("content", "")
+            parsed_calls = _parse_tool_calls_from_text(content)
+            if parsed_calls:
+                msg["tool_calls"] = parsed_calls
+                msg["_text_parsed"] = True
+            return msg
+
+        except RuntimeError as e:
+            err_str = str(e)
+            if "does not support tools" in err_str or \
+               ("400" in err_str and "tool" in err_str.lower()):
+                # Model doesn't support tools API — remember and fall through
+                _MODELS_WITHOUT_TOOLS_API.add(model)
+                logger.info("Model %s does not support tools API — "
+                            "falling back to text-based tool calling", model)
+            else:
+                raise  # Re-raise unrelated errors
+
+    # --- Fallback: without tools, rely on text parsing -------------------
     payload = {
         "model": model,
         "messages": messages,
-        "tools": tools,
+        "temperature": temperature,
+        "stream": False,
     }
-    if _is_reasoning:
-        payload["max_completion_tokens"] = max_tokens
-    else:
-        payload["temperature"] = temperature
-        payload["max_completion_tokens"] = max_tokens
-
     result = _http_post(
-        "https://api.openai.com/v1/chat/completions",
-        {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer %s" % api_key,
-        },
+        f"{server_url}/v1/chat/completions",
+        {"Content-Type": "application/json"},
         payload,
     )
-    return result["choices"][0]["message"]
+    msg = result["choices"][0]["message"]
+
+    if msg.get("content"):
+        msg["content"] = _strip_special_tokens(msg["content"])
+
+    content = msg.get("content", "")
+    parsed_calls = _parse_tool_calls_from_text(content)
+    if parsed_calls:
+        msg["tool_calls"] = parsed_calls
+        msg["_text_parsed"] = True
+
+    return msg
 
 
-def generate_with_tools(api_key, model, temperature, user_prompt,
-                        on_status=None, session_gen=None):
-    """Tool-calling loop: AI calls tools one at a time, gets results back.
+def _parse_tool_calls_from_text(text):
+    """Parse tool calls from text output when models don't use structured format.
 
-    This replaces the old generate_response → execute → assess cycle.
-    The AI decides what to do, calls tools, sees results, and continues
+    Handles patterns like:
+    - {"name": "execute_code", "arguments": {"code": "..."}}
+    - ```json\n{"name": ...}\n```
+    - <tool_call>{"name": ...}</tool_call>
+    """
+    import re
+    import uuid
+
+    if not text:
+        return None
+
+    tool_calls = []
+
+    # Pattern 1: <tool_call> tags (Qwen often uses these)
+    tag_pattern = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
+    tag_matches = re.findall(tag_pattern, text, re.DOTALL)
+
+    # Pattern 2: JSON blocks with "name" and "arguments"
+    json_pattern = r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\s*\}'
+    json_matches = re.findall(json_pattern, text, re.DOTALL)
+
+    # Pattern 3: code blocks with ```python or ```json containing tool calls
+    code_block_pattern = r'```(?:json|python)?\s*\n(\{.*?\})\s*\n```'
+    code_matches = re.findall(code_block_pattern, text, re.DOTALL)
+
+    # Try tag matches first
+    for match in tag_matches:
+        try:
+            data = json.loads(match)
+            name = data.get("name", "")
+            arguments = data.get("arguments", {})
+            if name and name in ("generate_mesh", "execute_code", "inspect_scene", "inspect_object",
+                                 "get_object_bounds", "inspect_timeline", "inspect_animation",
+                                 "capture_viewport", "declare_complete"):
+                tool_calls.append({
+                    "id": "call_%s" % uuid.uuid4().hex[:8],
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(arguments) if isinstance(arguments, dict) else arguments,
+                    },
+                })
+        except (json.JSONDecodeError, KeyError):
+            continue
+
+    if tool_calls:
+        return tool_calls
+
+    # Try direct JSON matches
+    for name, args_str in json_matches:
+        if name in ("generate_mesh", "execute_code", "inspect_scene", "inspect_object",
+                     "get_object_bounds", "inspect_timeline", "inspect_animation",
+                     "capture_viewport", "declare_complete"):
+            try:
+                args = json.loads(args_str)
+                tool_calls.append({
+                    "id": "call_%s" % uuid.uuid4().hex[:8],
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args),
+                    },
+                })
+            except json.JSONDecodeError:
+                continue
+
+    if tool_calls:
+        return tool_calls
+
+    # Try code block matches
+    for match in code_matches:
+        try:
+            data = json.loads(match)
+            name = data.get("name", "")
+            arguments = data.get("arguments", {})
+            if name:
+                tool_calls.append({
+                    "id": "call_%s" % uuid.uuid4().hex[:8],
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(arguments) if isinstance(arguments, dict) else arguments,
+                    },
+                })
+        except (json.JSONDecodeError, KeyError):
+            continue
+
+    if tool_calls:
+        return tool_calls
+
+    # Last resort: if the content contains Python code that looks like
+    # Blender code (import bpy, etc), wrap it in an execute_code call
+    if ("import bpy" in text or "bpy.ops." in text or "bpy.data." in text or
+            "bpy.context." in text):
+        # Extract code from markdown code blocks if present
+        code_extract = re.findall(r'```python\s*\n(.*?)```', text, re.DOTALL)
+        if code_extract:
+            code = "\n".join(code_extract)
+        else:
+            # Try to find the code portion (skip any explanation text)
+            lines = text.split("\n")
+            code_lines = []
+            in_code = False
+            for line in lines:
+                if any(kw in line for kw in ("import bpy", "import bmesh",
+                       "bpy.ops.", "bpy.data.", "bpy.context.",
+                       "create_box", "create_cylinder", "create_sphere",
+                       "quick_material", "pbr_material", "subsurf",
+                       "mirror(", "add_detail_cuts", "shape_body",
+                       "scale_section", "shade_auto_smooth")):
+                    in_code = True
+                if in_code:
+                    code_lines.append(line)
+            code = "\n".join(code_lines) if code_lines else ""
+
+        if code.strip():
+            tool_calls.append({
+                "id": "call_%s" % uuid.uuid4().hex[:8],
+                "type": "function",
+                "function": {
+                    "name": "execute_code",
+                    "arguments": json.dumps({"code": code}),
+                },
+            })
+            return tool_calls
+
+    return None
+
+
+def generate_with_tools(server_url, model, temperature, user_prompt,
+                        on_status=None, session_gen=None, timeout=180,
+                        mesh_server_url=None):
+    """Tool-calling loop: local LLM reasons and calls tools to build in Blender.
+
+    Args:
+        server_url: LLM API endpoint (e.g. ollama at localhost:11434)
+        model: LLM model name (e.g. qwen2.5vl:32b)
+        temperature: Sampling temperature
+        user_prompt: User's text request
+        on_status: Callback for UI progress updates
+        session_gen: Session generation counter
+        timeout: Max seconds for mesh generation
+        mesh_server_url: Optional URL for the trained mesh generation server
+    """
+    # Always use the chat tools path with local LLM for reasoning
+    return _generate_with_chat_tools(server_url, model, temperature, user_prompt,
+                                     on_status, session_gen,
+                                     mesh_server_url=mesh_server_url)
+
+
+def _generate_with_local_mesh(server_url, prompt, temperature, on_status, session_gen, timeout):
+    """Generate mesh using local server and return as code."""
+    try:
+        if on_status:
+            on_status(f"🎨 Generating 3D mesh (timeout: {timeout}s)...")
+        
+        # Call local mesh server
+        mesh_data = _generate_mesh_local(server_url, prompt, temperature, timeout)
+        
+        # Check for errors in response
+        if "error" in mesh_data:
+            error_msg = f"❌ Server error: {mesh_data['error']}"
+            add_message("user", prompt, session_gen=session_gen)
+            add_message("assistant", error_msg, session_gen=session_gen)
+            return error_msg, False
+        
+        if not mesh_data.get("objects") or len(mesh_data["objects"]) == 0:
+            error_msg = "❌ No mesh generated - server returned empty result"
+            add_message("user", prompt, session_gen=session_gen)
+            add_message("assistant", error_msg, session_gen=session_gen)
+            return error_msg, False
+        
+        if on_status:
+            on_status("📝 Converting to Blender code...")
+        
+        # Convert mesh to executable code
+        code = _mesh_to_code(mesh_data)
+        
+        # Execute the code on the MAIN THREAD (bpy is not thread-safe)
+        success, error = _run_on_main_thread(lambda: _execute_mesh_code(code))  # type: ignore[misc]
+        
+        if success:
+            summary = f"✅ Created mesh: {mesh_data['objects'][0]['name']}\n"
+            summary += f"Vertices: {mesh_data['objects'][0]['mesh']['num_vertices']}, "
+            summary += f"Faces: {mesh_data['objects'][0]['mesh']['num_faces']}\n"
+            summary += f"Generation time: {mesh_data.get('generation_time', 0)}s"
+            
+            # Store tokens + prompt for feedback (must run on main thread)
+            gen_tokens = mesh_data.get("tokens", [])
+            gen_prompt = prompt
+            if gen_tokens:
+                def _store_feedback_data():
+                    import bpy as _bpy  # type: ignore
+                    _props = _bpy.context.scene.ai_copilot
+                    _props.last_generation_tokens = json.dumps(gen_tokens)
+                    _props.compare_prompt = gen_prompt
+                _run_on_main_thread(_store_feedback_data)
+            
+            # Add to conversation history
+            add_message("user", prompt, session_gen=session_gen)
+            add_message("assistant", f"{summary}\n\n```python\n{code}\n```", session_gen=session_gen)
+            
+            return summary, True
+        else:
+            error_msg = f"❌ Failed to execute mesh code:\n{error[:500]}"
+            add_message("user", prompt, session_gen=session_gen)
+            add_message("assistant", error_msg, session_gen=session_gen)
+            return error_msg, False
+            
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        error_msg = f"❌ Server HTTP error {e.code}: {error_body[:200]}"
+        add_message("user", prompt, session_gen=session_gen)
+        add_message("assistant", error_msg, session_gen=session_gen)
+        return error_msg, False
+    except urllib.error.URLError as e:
+        error_msg = f"❌ Cannot connect to server: {str(e.reason)[:200]}"
+        add_message("user", prompt, session_gen=session_gen)
+        add_message("assistant", error_msg, session_gen=session_gen)
+        return error_msg, False
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        error_msg = f"❌ Mesh generation failed: {str(e)}\n{tb[:500]}"
+        add_message("user", prompt, session_gen=session_gen)
+        add_message("assistant", error_msg, session_gen=session_gen)
+        return error_msg, False
+
+
+def _execute_mesh_code(code: str) -> tuple[bool, str]:
+    """Execute mesh generation code in Blender."""
+    import bpy  # type: ignore
+    import bmesh  # type: ignore
+    from mathutils import Vector  # type: ignore
+    
+    try:
+        namespace = {
+            "__builtins__": __builtins__,
+            "bpy": bpy,
+            "bmesh": bmesh,
+            "Vector": Vector,
+        }
+        exec(code, namespace)
+        return True, ""
+    except Exception:
+        import traceback
+        return False, traceback.format_exc()
+
+
+def _generate_with_chat_tools(server_url, model, temperature, user_prompt,
+                              on_status, session_gen, mesh_server_url=None):
+    """Tool-calling loop using local LLM (ollama) as the reasoning brain.
+    
+    The LLM decides what to do, calls tools, sees results, and continues
     until it calls declare_complete or reaches the safety limit.
-
-    *on_status* — callback(str) for UI progress updates.
-
-    Returns ``(summary_text, is_complete)``.
+    
+    Args:
+        server_url: LLM API endpoint URL (e.g. ollama at localhost:11434)
+        model: LLM model name (e.g. qwen2.5vl:32b)
+        temperature: Sampling temperature
+        user_prompt: User's text request
+        on_status: Callback for UI progress updates
+        session_gen: Session generation counter
+        mesh_server_url: Optional URL for trained mesh generation server
+    
+    Returns:
+        (summary_text, is_complete): Result summary and completion status
     """
     from . import tool_defs
 
     clear_iteration_history()
+
+    # Wire mesh server URL so generate_mesh tool can reach it
+    if mesh_server_url:
+        tool_defs.set_mesh_server_url(mesh_server_url)
+    else:
+        # Default to localhost if not explicitly set
+        tool_defs.set_mesh_server_url("http://localhost:8420")
 
     # 1) Build initial context
     scene_ctx = get_scene_context()
@@ -1471,10 +2037,8 @@ def generate_with_tools(api_key, model, temperature, user_prompt,
     parts.append("[Your request]\n%s" % user_prompt)
     user_content = "\n\n".join(parts)
 
-    add_message("user", user_content, session_gen=session_gen)
-
-    # 2) Build messages
-    system_prompt = _build_tool_system_prompt()
+    # 2) Build messages — include history BEFORE adding current prompt
+    system_prompt = _build_tool_system_prompt(model)
     messages = [{"role": "system", "content": system_prompt}]
 
     # Include recent conversation history for multi-turn context
@@ -1482,37 +2046,25 @@ def generate_with_tools(api_key, model, temperature, user_prompt,
     for msg in recent:
         messages.append({"role": msg["role"], "content": msg["content"]})
 
-    # Optionally include viewport image
-    model_lower = model.lower()
-    supports_vision = not model_lower.startswith(("o1", "o3"))
-    if supports_vision:
-        viewport_image = _run_on_main_thread(_capture_viewport_image)
-        ref_images = _get_reference_images_base64()
-        if viewport_image or ref_images:
-            last_msg = messages[-1]
-            content_parts = [{"type": "text", "text": last_msg["content"]}]
-            if viewport_image:
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": viewport_image, "detail": "high"},
-                })
-            for ref_b64 in ref_images[:5]:
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": ref_b64, "detail": "high"},
-                })
-            messages[-1] = {"role": "user", "content": content_parts}
+    # Add current user message (after history, so it's not duplicated)
+    messages.append({"role": "user", "content": user_content})
+    add_message("user", user_content, session_gen=session_gen)
+
+    # Vision is supported via capture_viewport tool (qwen2.5vl handles images natively)
 
     # 3) Get tool definitions
     tools = tool_defs.get_tool_definitions()
 
     # 4) Tool-calling loop
-    MAX_ROUNDS = 30  # safety limit (each round can have multiple parallel tool calls)
-    MAX_TOTAL_CALLS = 60  # total tool invocations cap
+    MAX_ROUNDS = 15  # safety limit (each round can have multiple parallel tool calls)
+    MAX_TOTAL_CALLS = 40  # total tool invocations cap
     total_calls = 0
+    consecutive_text_rounds = 0  # rounds where LLM returned text instead of tool calls
+    repetitive_call_count = 0
+    dead_end_rounds = 0
+    recent_call_keys = []
     summary = ""
     is_complete = False
-    last_status = ""
 
     # Push an undo point before we start modifying the scene.
     # Must run on main thread; and bpy.ops.ed.undo_push can still fail
@@ -1528,6 +2080,9 @@ def generate_with_tools(api_key, model, temperature, user_prompt,
     for round_num in range(MAX_ROUNDS):
         # Check for session cancellation
         if session_gen is not None and session_gen != _session_generation:
+            print("[Blender Copilot] SESSION CANCELLED: round %d, "
+                  "expected gen=%d, current gen=%d"
+                  % (round_num, session_gen, _session_generation))
             return "Session cancelled", False
 
         # Update status
@@ -1536,34 +2091,106 @@ def generate_with_tools(api_key, model, temperature, user_prompt,
 
         # Call the API with tools
         response_msg = _chat_with_tools(
-            api_key, model, messages, tools, temperature)
+            server_url, model, messages, tools, temperature)
 
-        # Add assistant message to conversation
-        messages.append(response_msg)
+        # If the model was just detected as not supporting tools API,
+        # update the system prompt to include text-based tool instructions
+        # so subsequent rounds have the right guidance.
+        if model in _MODELS_WITHOUT_TOOLS_API and \
+                _TEXT_TOOL_CALL_INSTRUCTIONS not in messages[0]["content"]:
+            messages[0]["content"] = _build_tool_system_prompt(model)
+            logger.info("Updated system prompt with text-based tool instructions")
+
+        # Extract tool calls from the response
+        tool_calls = response_msg.get("tool_calls") or []
+        text_parsed = response_msg.get("_text_parsed", False)
+
+        # Log what the model returned for debugging
+        tc_names = [tc["function"]["name"] for tc in tool_calls] if tool_calls else []
+        logger.info("Round %d: %d tool calls %s (text_parsed=%s, total_calls=%d)",
+                     round_num + 1, len(tool_calls), tc_names, text_parsed, total_calls)
 
         # Check if AI returned a text response (no tool calls = done thinking)
-        tool_calls = response_msg.get("tool_calls")
         if not tool_calls:
-            # AI is done — extract final text
-            content = response_msg.get("content", "")
-            summary = content
-            add_message("assistant", content, session_gen=session_gen)
+            consecutive_text_rounds += 1
+            content = _strip_special_tokens(response_msg.get("content", ""))
+            logger.info("Round %d: text-only response (consecutive=%d, total_calls=%d)",
+                        round_num + 1, consecutive_text_rounds, total_calls)
 
             # Check for COMPLETE marker
+            has_complete = False
             if content:
                 for line in content.split("\n"):
                     if line.strip().upper().startswith("COMPLETE"):
-                        is_complete = True
+                        has_complete = True
                         break
-            break
 
-        # Execute each tool call
+            if has_complete:
+                messages.append(response_msg)
+                summary = content
+                is_complete = True
+                add_message("assistant", content, session_gen=session_gen)
+                break
+
+            # Auto-complete if the LLM keeps returning text instead of
+            # tool calls — it's stuck and nudging won't help
+            if consecutive_text_rounds >= 3 and total_calls >= 1:
+                logger.info("Auto-completing: %d consecutive text rounds, %d total calls",
+                            consecutive_text_rounds, total_calls)
+                summary = content or "Generation complete"
+                is_complete = True
+                add_message("assistant", summary, session_gen=session_gen)
+                break
+
+            # Nudge it to use tools — but only once or twice
+            messages.append(response_msg)
+            if total_calls < 2:
+                messages.append({"role": "user", "content":
+                    "You must call tools to build the scene. Start by calling "
+                    "generate_mesh with a prompt describing the object. "
+                    "Then use execute_code to add materials."})
+            else:
+                messages.append({"role": "user", "content":
+                    "If you are done, call declare_complete with a summary. "
+                    "Otherwise call execute_code to add materials or adjust objects."})
+            continue
+
+        # Add assistant message to conversation
+        if text_parsed:
+            # For text-parsed tool calls: keep original text as assistant message
+            # (the model output text, not structured tool_calls)
+            asst_content = response_msg.get("content", "")
+            messages.append({"role": "assistant", "content": asst_content})
+        else:
+            # For structured tool calls: keep tool_calls in the message
+            asst_msg = {"role": "assistant", "content": response_msg.get("content", "")}
+            asst_msg["tool_calls"] = response_msg["tool_calls"]
+            messages.append(asst_msg)
+
+        # Got real tool calls — reset text-only counter
+        consecutive_text_rounds = 0
+
+        # Execute each tool call and collect results
+        tool_results_text = []
+        round_had_error = False
+        round_repeated_calls = 0
         for tc in tool_calls:
             func_name = tc["function"]["name"]
             try:
                 args = json.loads(tc["function"]["arguments"])
             except json.JSONDecodeError:
                 args = {}
+
+            call_key = "%s|%s" % (
+                func_name,
+                json.dumps(args, sort_keys=True, separators=(",", ":")),
+            )
+            recent_call_keys.append(call_key)
+            if len(recent_call_keys) > 12:
+                recent_call_keys = recent_call_keys[-12:]
+            if len(recent_call_keys) >= 3 and all(k == call_key for k in recent_call_keys[-3:]):
+                repetitive_call_count += 1
+                round_repeated_calls += 1
 
             total_calls += 1
 
@@ -1573,48 +2200,126 @@ def generate_with_tools(api_key, model, temperature, user_prompt,
                 ", ".join("%s=%s" % (k, str(v)[:30])
                           for k, v in list(args.items())[:3])
             )
-            last_status = status_text
             _update_streaming(status_text)
 
-            # Check for declare_complete
+            # declare_complete finishes the loop when the model decides the task is done.
             if func_name == "declare_complete":
                 summary = args.get("summary", "Model complete")
                 is_complete = True
                 tool_result = json.dumps({"status": "COMPLETE"})
-            # Check for capture_viewport (needs special handling for vision)
+            # capture_viewport — capture image and send to VL model for
+            # visual verification.  qwen2.5vl supports vision natively.
             elif func_name == "capture_viewport":
-                vp_result = _run_on_main_thread(
-                    lambda: tool_defs.execute_tool("capture_viewport", {}))
-                if supports_vision and "image" in vp_result:
-                    # Return the image as a multimodal tool result
-                    tool_result_content = [
-                        {"type": "text", "text": json.dumps({"status": "viewport captured"})},
-                        {"type": "image_url",
-                         "image_url": {"url": vp_result["image"], "detail": "high"}},
-                    ]
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": tool_result_content,
+                # Run the real capture on main thread (renders via bpy)
+                capture_result = _run_on_main_thread(
+                    lambda: tool_defs.execute_tool("capture_viewport", args))
+                # Also grab scene text data for context
+                scene_data = _run_on_main_thread(
+                    lambda: tool_defs.execute_tool("inspect_scene", {}))
+                # If we got a base64 image, inject it as a vision message
+                # so the VL model can actually *see* the viewport.
+                img_b64 = None
+                if isinstance(capture_result, dict):
+                    img_data = capture_result.get("image", "")
+                    if img_data.startswith("data:image"):
+                        # Strip data URI prefix → raw base64
+                        img_b64 = img_data.split(",", 1)[-1]
+                if img_b64 and "vl" in model.lower():
+                    # Ollama OpenAI-compat: multipart content with image_url
+                    vision_msg = {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": (
+                                "Here is the current viewport screenshot. "
+                                "Scene data: " + json.dumps(scene_data)
+                            )},
+                            {"type": "image_url", "image_url": {
+                                "url": "data:image/png;base64," + img_b64
+                            }},
+                        ],
+                    }
+                    messages.append(vision_msg)
+                    tool_result = json.dumps({
+                        "status": "viewport image sent for visual inspection",
+                        "scene_description": scene_data,
                     })
-                    continue  # skip the normal tool result append
                 else:
-                    tool_result = json.dumps({"status": "viewport captured (no image)"})
+                    # Non-VL model or capture failed — text fallback
+                    tool_result = json.dumps({
+                        "status": "viewport captured",
+                        "scene_description": scene_data,
+                    })
+            elif func_name == "generate_mesh":
+                # Special handling: HTTP fetch runs in background thread,
+                # only the Blender object creation runs on main thread.
+                # This avoids freezing Blender UI during model inference.
+                mesh_data = tool_defs.fetch_mesh_from_server(args)
+                if "error" in mesh_data:
+                    tool_result = json.dumps(mesh_data)
+                else:
+                    # Create mesh on main thread
+                    result = _run_on_main_thread(
+                        lambda a=args, md=mesh_data: tool_defs.create_mesh_object(a, md))
+
+                    # Store tokens for RLHF feedback (approve/reject)
+                    gen_tokens = mesh_data.get("tokens", [])
+                    gen_prompt = args.get("prompt", user_prompt)
+                    if gen_tokens:
+                        def _store_tokens(t=gen_tokens, p=gen_prompt):
+                            import bpy as _bpy
+                            _props = _bpy.context.scene.ai_copilot
+                            _props.last_generation_tokens = json.dumps(t)
+                            _props.compare_prompt = p
+                        _run_on_main_thread(_store_tokens)
+
+                    result_str = json.dumps(result)
+                    if len(result_str) > 4000:
+                        result_str = result_str[:4000] + '..."}'
+                    tool_result = result_str
             else:
                 # Execute tool on main thread
                 result = _run_on_main_thread(
                     lambda fn=func_name, a=args: tool_defs.execute_tool(fn, a))
                 # Cap result size for token efficiency
                 result_str = json.dumps(result)
+                if isinstance(result, dict) and result.get("error"):
+                    round_had_error = True
                 if len(result_str) > 4000:
                     result_str = result_str[:4000] + '..."}'
                 tool_result = result_str
 
+            if text_parsed:
+                # Collect results for a combined user message
+                tool_results_text.append("[%s result]: %s" % (func_name, tool_result))
+            else:
+                # Structured tool calls: use proper tool role
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": tool_result,
+                })
+
+        # For text-parsed calls: send all results as a single user message
+        # so the model can see them (it doesn't understand "tool" role)
+        if text_parsed and tool_results_text:
+            results_msg = "Your code has been executed. Do NOT repeat it.\n\n" + "\n".join(tool_results_text)
+            results_msg += "\n\nIf the task is complete, call declare_complete. Otherwise, continue with the next step."
+            messages.append({"role": "user", "content": results_msg})
+
+        if round_repeated_calls > 0 or round_had_error:
+            dead_end_rounds += 1
             messages.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "content": tool_result,
+                "role": "user",
+                "content": (
+                    "You are in a recovery state. Do not repeat the same tool call with the same args. "
+                    "Use PLAN-FIRST execution: (1) one-sentence decomposition, "
+                    "(2) inspect_scene or inspect_object, "
+                    "(3) one corrective tool call, "
+                    "(4) capture_viewport or inspect_scene to verify, then continue or declare_complete."
+                ),
             })
+        else:
+            dead_end_rounds = max(0, dead_end_rounds - 1)
 
         # After declare_complete, break out
         if is_complete:
@@ -1638,6 +2343,13 @@ def generate_with_tools(api_key, model, temperature, user_prompt,
     finalize_iteration()
     _save_chat_log()
 
+    if summary:
+        summary += "\n\nTool loop stats: total_calls=%d, repetitive_calls=%d, dead_end_rounds=%d" % (
+            total_calls,
+            repetitive_call_count,
+            dead_end_rounds,
+        )
+
     return summary, is_complete
 
 
@@ -1645,104 +2357,397 @@ def generate_with_tools(api_key, model, temperature, user_prompt,
 # Compact System Prompt — for tool-calling mode
 # ═══════════════════════════════════════════════════════════════════════════
 
-_TOOL_SYSTEM_PROMPT = """\
-You are **Blender Copilot** — an expert 3D artist controlling Blender via Python.
-You model like a real artist: starting from primitives and using modifiers,
-loop cuts, and section-based shaping — NEVER inventing raw vertex coordinates.
+_TOOL_SYSTEM_PROMPT = """You are Blender Copilot, an AI that creates 3D scenes through iterative refinement.
+You have a trained mesh generation model that produces detailed geometry (up to 8000 faces).
 
-═══ AVAILABLE TOOLS ═══
-• execute_code — Python code with all blender_tools pre-imported (PRIMARY)
-• inspect_scene / inspect_object / get_object_bounds — check your work
-• capture_viewport — screenshot for visual verification
-• declare_complete — signal when done
+═══ YOUR WORKFLOW: PLAN → GENERATE → REFINE → ITERATE ═══
 
-═══ THE GOLDEN RULE ═══
-**NEVER invent raw (x,y,z) vertex coordinates or Bézier control points.**
-LLMs cannot spatially reason about 3D coordinates. Instead:
-• Use primitives (create_box, create_cylinder, create_sphere)
-• Reshape with section-based tools (shape_body, scale_section, taper, pinch, bulge)
-• Add detail with modifiers (subsurf, mirror, bevel)
-• Combine with booleans (boolean_cut, boolean_join)
+**STEP 1: COMPOSITIONAL PLANNING** (CRITICAL — DO THIS FIRST)
+Before generating anything, mentally decompose the request into parts:
 
-═══ BOX-MODELING WORKFLOW (Preferred for ALL complex shapes) ═══
-Step 1: CREATE a box primitive with real-world dimensions
-Step 2: ADD TOPOLOGY with add_detail_cuts(obj, axis, num_cuts=10-15)
-Step 3: SHAPE THE BODY with shape_body(obj, axis, profile) using ratio tuples:
-   shape_body(body, 'X', [
-       (0.00, 0.40, 0.35),  # front — narrow, low
-       (0.15, 0.80, 0.60),  # hood
-       (0.30, 0.95, 1.00),  # A-pillar → roof
-       (0.50, 1.00, 1.00),  # cabin center — widest
-       (0.75, 0.90, 0.85),  # C-pillar taper
-       (1.00, 0.55, 0.40),  # tail — narrow
-   ])
-   Each tuple is (fraction, width_ratio, height_ratio) — fractions 0-1,
-   ratios relative to current dimensions (1.0 = unchanged).
-Step 4: ADD MIRROR modifier (mirror(obj, 'Y')) for left/right symmetry
-Step 5: ADD SUBSURF modifier (subsurf(obj, levels=2)) for smooth surfaces
-Step 6: ADD CREASES for sharp edges (crease_edge_loop_at, set_edge_crease)
-Step 7: BUILD SUB-PARTS as separate objects:
-   • wheel(name, radius, width, location) — complete tire+rim
-   • headlight(name, size, location, color) — emissive sphere
-   • window_glass(name, width, height, depth, location) — glass panel
-Step 8: MATERIALS — every surface gets a material (quick_material, pbr_material)
-Step 9: VERIFY with inspect_object + capture_viewport
-Step 10: DECLARE COMPLETE
+Example: "treasure chest"
+→ Think: "A treasure chest has: bottom box, lid, hinges, lock, metal bands, maybe treasure inside"
+→ Decision: Generate bottom and lid as separate meshes. Add hinges and details programmatically.
 
-═══ ALTERNATIVE TECHNIQUES ═══
-• taper(obj, axis, start_scale, end_scale) — linear narrowing
-• pinch(obj, axis, position, radius, strength) — local narrowing (waist, neck)
-• bulge(obj, axis, position, radius, strength) — local widening (fenders)
-• bend(obj, axis, angle_deg) — curve the mesh
-• extrude_and_scale(obj, face_indices, offset, scale) — inset detail
-• carve_groove(obj, axis, position, width, depth) — panel lines
-• sculpt_move(obj, center, radius, offset) — grab-brush deformation
-• flatten_region(obj, center, radius, axis) — flat surfaces
+Example: "sports car"  
+→ Think: "A car has: body, wheels (4), windows, headlights, grille"
+→ Decision: Generate the main body mesh. Create wheels with primitives + array. Add details.
 
-═══ FINDING FACES ═══
-Use these to get face indices for extrude/inset operations:
-• select_top_faces(obj) / select_bottom_faces(obj)
-• select_front_faces(obj) / select_back_faces(obj)
-• select_left_faces(obj) / select_right_faces(obj)
-• select_faces_by_position(obj, axis, min_val, max_val, normal_axis, normal_sign)
+Example: "coffee mug"
+→ Think: "Simple object — cylinder body + handle"
+→ Decision: Generate the mug as one mesh. The model can handle this complexity.
 
-═══ RELATIVE POSITIONING ═══
-• place_at_bounds(obj, target, position='FRONT_BOTTOM', offset=0.1)
-• get_bounds(obj) → use .min_x, .max_x, .center_y, .depth, etc.
-• stack_on(obj, target) — place on top
-• center_at(obj, x=0, y=0) — center at position
+**CRITICAL RULES FOR PLANNING:**
+- Complex multi-part objects (furniture, vehicles, buildings) → generate main components separately
+- Simple objects (cups, balls, boxes) → generate as one mesh
+- Symmetric objects → generate one half, use mirror modifier
+- Repeated elements (wheels, windows, tiles) → generate one, use array modifier
+- Fine details (screws, bolts, text) → add via execute_code, not generate_mesh
 
-═══ AXIS CONVENTIONS ═══
-• Z = UP (always)  •  X = forward/back (car length)  •  Y = left/right (car width)
-• get_object_bounds: width_x=X, depth_y=Y, height_z=Z
-• Lateral offset uses depth_y/2, NOT width_x/2
+For complex objects, ALWAYS decompose into semantic parts before generating:
+- Vehicle: [body, wheels, windows, interior, engine/details]
+- Character: [body, head, hands, feet, clothes, accessories]
+- Building: [foundation, walls, roof, windows/doors, details]
+- Furniture: [frame, surfaces, supports, cushions/padding]
+Generate each part separately, place with location+scale, then merge with
+join_objects_with_cleanup() after all parts are correctly placed.
 
-═══ CRITICAL RULES ═══
-1. Write BULK code — 10-20 operations per execute_code call
-2. Build all main parts in 1-2 code blocks, then refine
-3. REAL-WORLD scale: car=4.5m, human=1.75m, door=0.9×2.1m
-4. Every surface gets a material — no grey defaults
-5. Position sub-parts RELATIVE to main body using get_bounds
-6. Call merge_by_distance() after booleans, recalc_normals() for clean mesh
-7. NEVER call clear_scene() unless user explicitly asks
-8. shade_auto_smooth(obj) for final presentation
+**STEP 2: GENERATE BASE GEOMETRY**
+Call generate_mesh for each main component with DETAILED prompts:
+- Good: "detailed sports car body with aerodynamic curves, hood, roof, trunk"
+- Bad: "car body" (too vague)
 
-═══ AVOID THESE FUNCTIONS ═══
-• shape_from_profiles() — requires inventing curve control points
-• mesh_from_outlines() — same problem
-• revolve_profile() — same problem
-• create_mesh(verts=...) — raw coordinate invention
-• loft_sections(sections=...) — coordinate arrays
-Do NOT use any function requiring lists of (x,y,z) coordinate tuples.
+The model can generate complex shapes (up to 8000 faces). Be specific about:
+- Style (modern, vintage, sci-fi, organic)
+- Detail level (simple, detailed, high-poly)
+- Key features (curved, angular, smooth, rough)
 
-═══ AVAILABLE FUNCTIONS ═══
-{tools_reference}
+**STEP 3: INSPECT & REFINE**
+After generation, use inspect_object to check:
+- Vertex/face count — is it detailed enough?
+- Dimensions — correct scale?
+- Visual quality — call capture_viewport if unsure
+
+Then refine using vertex-level editing:
+```python
+# Select problematic vertices
+verts = select_vertices_by_location(obj, 'Z', min_val=2.0)
+# Move them
+move_vertices(obj, verts, offset=(0, 0, 0.5))
+# Smooth sharp areas
+smooth_vertices(obj, verts, iterations=2, factor=0.7)
+```
+
+**STEP 4: ASSIGN MATERIALS TO REGIONS**
+Don't just assign one material to the whole object. Use face selection:
+```python
+# Select faces by orientation
+top_faces = select_faces_by_normal(car, (0, 0, 1), 0.8)
+paint = quick_material("Paint", color=(0.8, 0.1, 0.1), metallic=0.9)
+assign_material_to_faces(car, paint, top_faces)
+
+# Windows
+window_faces = select_faces_by_normal(car, (0, 0, 1), 0.95)
+glass = glass_material("Glass", color=(0.7, 0.8, 0.9))
+assign_material_to_faces(car, glass, window_faces)
+```
+
+**STEP 5: ADD FINAL DETAIL**
+- Subdivision surface for smoothness: `subsurf(obj, levels=2)`
+- Bevel edges: `bevel(obj, width=0.01, segments=2)`
+- Mirror for symmetry: `mirror(obj, axis='X')`
+- Array for repetition: `array(wheels, count=4, offset=(2, 0, 0))`
+
+**STEP 6: ITERATE**
+- Call inspect_scene or capture_viewport to check results
+- If something looks wrong: select vertices/faces and refine
+- Add more detail if needed
+- Adjust materials
+
+**STEP 7: DECLARE COMPLETE**
+Only when the scene looks good and all requested elements are present.
+
+═══ TOOLS ═══
+1. **generate_mesh**(prompt, name, temperature, max_faces) — Generate detailed 3D geometry
+2. **execute_code**(code) — Run Python with all blender_tools pre-imported
+3. **inspect_scene**() / **inspect_object**(name) / **get_object_bounds**(name)
+4. **inspect_timeline**() — Get fps, frame range, per-object keyframes with timestamps
+5. **inspect_animation**(name) — Detailed animation data for one object (FCurves, NLA, drivers)
+6. **capture_viewport**() — Screenshot for visual verification
+7. **declare_complete**(summary) — Signal completion
+
+Inspection helpers via execute_code:
+- inspect_materials_detail(obj) — full material node tree info
+- inspect_modifiers(obj) — all modifiers with settings
+- inspect_constraints(obj) — all constraints with settings
+- inspect_armature(obj) — bone hierarchy, IK chains, pose
+- inspect_physics(obj) — rigid body, cloth, particles
+- inspect_shape_keys(obj) — shape keys with values/drivers
+- inspect_vertex_groups(obj) — vertex groups with counts
+- inspect_uv_maps(obj) — UV layers
+- inspect_scene_hierarchy() — collection tree + parenting
+- inspect_render_settings() — engine, resolution, samples
+- inspect_world() — environment/HDRI settings
+
+═══ BLENDER_TOOLS REFERENCE (pre-imported in execute_code) ═══
+All 290+ functions below are pre-imported. Call them directly in execute_code.
+
+**Vertex/Face Selection & Editing:**
+- select_vertices_by_location(obj, axis, min_val, max_val) → vertex indices
+- select_faces_by_normal(obj, direction, threshold) → face indices
+- select_faces_by_position(obj, axis, min_val, max_val) → face indices
+- move_vertices(obj, vertex_indices, offset=(x,y,z))
+- scale_vertices(obj, vertex_indices, scale=(sx,sy,sz), pivot='center')
+- smooth_vertices(obj, vertex_indices, iterations=2, factor=0.5)
+- get_vertex_positions(obj, vertex_indices) → list of (x,y,z)
+- extrude_faces(obj, face_indices, offset=1.0)
+- inset_faces(obj, face_indices, thickness=0.1)
+- bevel_edges(obj, edge_indices, width=0.05, segments=3)
+- bridge_edge_loops(obj, loop1, loop2)
+- loop_cut(obj, edge_index, cuts=1)
+
+**Material & Texturing:**
+- quick_material(name, color, roughness, metallic) → material
+- glass_material(name, color, roughness, ior)
+- emission_material(name, color, strength)
+- pbr_material(name, base_color, roughness, metallic, normal_strength)
+- subsurface_material(name, color, subsurface, roughness) — skin/wax/marble
+- image_texture_material(name, image_path, roughness, metallic)
+- gradient_material(name, color1, color2, axis)
+- noise_texture_material(name, base_color, scale, detail)
+- wood_material(name, base_color, grain_scale)
+- brick_texture_material(name, brick_color, mortar_color)
+- environment_texture(image_path, strength) — HDRI world lighting
+- assign_material(obj, mat) / assign_material_to_faces(obj, mat, face_indices)
+- assign_material_by_normal(obj, mat, axis, direction, threshold)
+- add_normal_map(mat, image_path, strength)
+- add_displacement(mat, strength, midlevel, image_path)
+
+**Positioning & Transforms:**
+- get(name) → object by name
+- move_to(obj, x, y, z) / rotate_deg(obj, x, y, z) / scale_to(obj, x, y, z)
+- get_bounds(obj) → bounding box
+- place_on_ground(obj) / stack_on(obj, target, gap)
+- snap_object_to(obj, target, snap='BOTTOM_TO_TOP')
+- align_objects(objects, axis, mode)
+- set_parent(child, parent) / apply_transforms(obj)
+
+**Modifiers:**
+- subsurf(obj, levels) / bevel(obj, width, segments)
+- mirror(obj, axis) / array(obj, count, offset)
+- solidify(obj, thickness) / boolean_cut(target, cutter)
+- boolean_join(target, other) / decimate(obj, ratio)
+- simple_deform(obj, method, angle, axis)
+- shrinkwrap(obj, target) / wireframe_modifier(obj, thickness)
+- screw_modifier(obj, angle_deg, steps, axis)
+
+**Curves:**
+- create_bezier_curve(name, points) / create_nurbs_curve(name, points)
+- sweep_profile_along_curve(name, profile, path)
+- revolve_profile(name, profile, axis, segments)
+
+**Animation & Keyframing:**
+- set_frame_range(start, end) / set_current_frame(frame) / set_fps(fps)
+- insert_keyframe(obj, data_path, frame) — keyframe any property
+- animate_location(obj, [(frame, (x,y,z)), ...])
+- animate_rotation(obj, [(frame, (rx,ry,rz)), ...])
+- animate_scale(obj, [(frame, (sx,sy,sz)), ...])
+- animate_value(obj, data_path, [(frame, value), ...]) — animate anything
+- set_interpolation(obj, 'LINEAR'|'BEZIER'|'CONSTANT')
+- set_extrapolation(obj, 'CONSTANT'|'LINEAR'|'MAKE_CYCLIC')
+- create_action(name) / set_action(obj, action) / push_to_nla(obj, track)
+- add_follow_path(obj, curve) — animate along a curve
+- clear_animation(obj) / add_marker(name, frame)
+
+**Armature & Rigging:**
+- create_armature(name, location) → armature object
+- add_bone(arm, name, head, tail, parent_bone, connected)
+- extrude_bone(arm, parent_bone, name, tail_offset)
+- create_bone_chain(arm, name, joints) — chain from joint positions
+- parent_to_armature(mesh, armature, method='ARMATURE_AUTO') — auto weights
+- set_bone_ik(arm, bone, target, chain_length) — inverse kinematics
+- add_bone_constraint(arm, bone, type, target, **kwargs)
+- pose_bone(arm, bone, rotation_euler=(rx,ry,rz))
+- keyframe_bone(arm, bone, data_path, frame)
+- get_bones(arm) → list of bone info
+- mirror_bones(arm) — mirror .L bones to .R
+
+**Shape Keys:**
+- add_shape_key(obj, name) — add a morph target
+- edit_shape_key(obj, name, {vert_idx: (dx,dy,dz), ...})
+- set_shape_key_value(obj, name, value) — blend 0.0–1.0
+- animate_shape_key(obj, name, [(frame, value), ...])
+- get_shape_keys(obj) → list of shape key info
+
+**Drivers:**
+- add_driver(obj, driven_path, driver_obj, driver_path, expression)
+- add_expression_driver(obj, path, expr, variables={name: (obj, path)})
+- remove_driver(obj, path)
+
+**Object Constraints:**
+- add_constraint(obj, type, target, **kwargs) — any constraint
+- add_copy_location(obj, target) / add_copy_rotation(obj, target)
+- add_track_to(obj, target) — always look at target
+- add_floor_constraint(obj, target) / add_follow_path(obj, curve)
+- remove_constraint(obj, name)
+
+**Particle Systems:**
+- add_particle_emitter(obj, count, lifetime, velocity, size)
+- add_hair_system(obj, count, length, segments)
+- set_particle_instance(particle_obj, instance_obj) — scatter objects
+- remove_particles(obj)
+
+**Physics:**
+- add_rigid_body(obj, 'ACTIVE'|'PASSIVE', mass, bounciness)
+- add_cloth(obj, stiffness, damping) / add_collision(obj)
+- add_soft_body(obj, mass, goal_strength)
+- add_force_field(field_type='WIND'|'TURBULENCE'|'VORTEX', strength)
+- set_gravity(x, y, z) / bake_physics(start, end) / free_physics_bake()
+
+**Rendering:**
+- set_render_engine('CYCLES'|'BLENDER_EEVEE_NEXT')
+- set_render_resolution(x, y) / set_render_samples(samples, denoise)
+- render_image(filepath) / render_animation(filepath)
+- set_output_path(path, file_format)
+- set_transparent_background(True) / set_color_management(view_transform)
+
+**Cameras & Lighting:**
+- add_camera(name, location, look_at, lens) / set_active_camera(cam)
+- add_depth_of_field(cam, focus_object, fstop)
+- setup_sun(energy, rotation_deg) / setup_point_light / setup_area_light
+- setup_sky_texture(sun_elevation) / setup_gradient_world(colors)
+
+**Compositor (quick recipes):**
+- setup_compositor() / add_glare(type, threshold)
+- add_color_correction(brightness, contrast, saturation)
+- add_vignette(amount)
+
+**Compositor (generic node editing):**
+- add_compositor_node(type, name) — 'glare','blur','bright_contrast','hue_sat', etc.
+- get_compositor_node(name) / remove_compositor_node(name)
+- connect_compositor_nodes(from_node, from_output, to_node, to_input)
+- insert_compositor_node_between(type, before, after) — auto-relinks chain
+- auto_arrange_compositor() / clear_compositor()
+- add_viewer_node() — for previewing compositor output
+- set_node_input(node, input_name, value)
+- set_node_property(node, prop_name, value)
+
+**Shader Node Editing (generic — build ANY material):**
+- add_shader_node(mat, type, name) — 'noise','voronoi','colorramp','bump', etc.
+- get_node(mat, name) / remove_node(mat, name)
+- connect_nodes(mat, from_node, from_output, to_node, to_input)
+- disconnect_node_input(mat, node, input_name)
+- set_node_input(node, input_name, value) / get_node_input(node, input_name)
+- set_node_property(node, prop_name, value) — operation, blend_type, etc.
+- set_colorramp_stops(node, [(pos, color), ...])
+- list_node_inputs(node) / list_node_outputs(node)
+- auto_arrange_nodes(mat) — clean horizontal layout
+- clear_material_nodes(mat) / duplicate_material(mat, new_name)
+
+**Weight Painting & Vertex Groups:**
+- create_vertex_group(obj, name, vert_indices, weight)
+- set_vertex_weights(obj, group, verts, weight)
+- paint_weight_gradient(obj, group, axis, min_weight, max_weight)
+- normalize_weights(obj) / get_vertex_weights(obj, group)
+
+**Scene Utilities:**
+- get_scene_info() → comprehensive scene data
+- list_actions() / list_materials()
+- clear_scene() / scene_objects()
+
+**Inspection Tools (via execute_code):**
+- inspect_materials_detail(obj) → full material node trees with colors/values
+- inspect_modifiers(obj) → all modifiers with type-specific settings
+- inspect_constraints(obj) → all constraints with targets/influence
+- inspect_armature(obj) → bone hierarchy, pose bones, IK chains
+- inspect_physics(obj) → rigid body, cloth, particles, collision
+- inspect_shape_keys(obj) → key blocks with values, ranges, drivers
+- inspect_vertex_groups(obj) → groups with vertex counts
+- inspect_uv_maps(obj) → UV layers with active status
+- inspect_scene_hierarchy() → collection tree + parent relationships
+- inspect_render_settings() → engine, resolution, samples, output
+- inspect_world() → environment, HDRI, sky settings
+
+═══ WORKFLOW PATTERNS FOR DIFFERENT TASKS ═══
+
+**Animation Workflow:**
+1. Set timeline: set_frame_range(1, 120), set_fps(24)
+2. Keyframe: animate_location(obj, [(1, start), (60, mid), (120, end)])
+3. Adjust curves: set_interpolation(obj, 'BEZIER')
+4. For looping: set_extrapolation(obj, 'MAKE_CYCLIC')
+
+**Rigging Workflow:**
+1. Create armature: arm = create_armature("Rig")
+2. Add bones: add_bone(arm, "spine", head, tail), add_bone(arm, "chest", ...)
+3. Parent mesh: parent_to_armature(mesh, arm, 'ARMATURE_AUTO')
+4. Add IK: set_bone_ik(arm, "hand.L", target_obj=ik_empty, chain_length=3)
+5. Pose & keyframe: pose_bone(arm, "upper_arm.L", rotation_euler=(0,0,-45))
+                     keyframe_bone(arm, "upper_arm.L", 'rotation_euler', frame=1)
+
+**Physics Workflow:**
+1. Set up: add_rigid_body(ball, 'ACTIVE', mass=2), add_rigid_body(floor, 'PASSIVE')
+2. Optional: add_force_field(field_type='WIND', strength=5)
+3. Bake: bake_physics(1, 250)
+
+**Material Workflow (simple):**
+1. Create: mat = pbr_material("Metal", roughness=0.2, metallic=1.0)
+2. Add detail: add_normal_map(mat, "//textures/scratches.jpg")
+3. Assign to faces: assign_material_to_faces(obj, mat, top_faces)
+
+**Material Workflow (node editing for complex shaders):**
+1. Start: mat = quick_material("Rock"); clear_material_nodes(mat)
+2. Add nodes: noise = add_shader_node(mat, 'noise', name='RockNoise')
+3. Configure: set_node_input(noise, 'Scale', 15.0)
+4. Add color ramp: ramp = add_shader_node(mat, 'colorramp')
+   set_colorramp_stops(ramp, [(0, (0.2,0.15,0.1,1)), (1, (0.5,0.4,0.3,1))])
+5. Wire up: connect_nodes(mat, noise, 'Fac', ramp, 'Fac')
+   bsdf = get_node(mat, 'Principled BSDF')
+   connect_nodes(mat, ramp, 'Color', bsdf, 'Base Color')
+6. Clean layout: auto_arrange_nodes(mat)
+
+**Compositor Workflow:**
+1. Enable: setup_compositor()
+2. Add effects: glare = add_compositor_node('glare', name='Bloom')
+   set_node_property(glare, 'glare_type', 'FOG_GLOW')
+   set_node_input(glare, 'Threshold', 0.8)
+3. Or insert inline: insert_compositor_node_between('glare', 'Render Layers', 'Composite')
+4. Preview: add_viewer_node()
+5. Clean layout: auto_arrange_compositor()
 """
 
 
-def _build_tool_system_prompt():
-    ref = _get_tools_reference()
-    return _TOOL_SYSTEM_PROMPT.replace("{tools_reference}", ref)
+def _build_tool_system_prompt(model=None):
+    """Build the tool-calling system prompt.
+
+    If *model* is in the no-tools-API cache, append explicit JSON
+    call-format instructions so the model knows how to invoke tools
+    via plain text output.
+    """
+    prompt = _TOOL_SYSTEM_PROMPT
+    if model and model in _MODELS_WITHOUT_TOOLS_API:
+        prompt += _TEXT_TOOL_CALL_INSTRUCTIONS
+    return prompt
+
+
+_TEXT_TOOL_CALL_INSTRUCTIONS = """
+
+═══ HOW TO CALL TOOLS (IMPORTANT) ═══
+Your model does NOT support structured tool calls.
+To invoke a tool, output a JSON block wrapped in <tool_call> tags:
+
+<tool_call>
+{"name": "generate_mesh", "arguments": {"prompt": "a wooden chair", "max_faces": 2048}}
+</tool_call>
+
+<tool_call>
+{"name": "execute_code", "arguments": {"code": "mat = quick_material('Wood', color=(0.4, 0.25, 0.1))\nassign_material(get('wooden_chair'), mat)"}}
+</tool_call>
+
+<tool_call>
+{"name": "inspect_scene", "arguments": {}}
+</tool_call>
+
+<tool_call>
+{"name": "inspect_timeline", "arguments": {}}
+</tool_call>
+
+<tool_call>
+{"name": "inspect_animation", "arguments": {"name": "Cube"}}
+</tool_call>
+
+<tool_call>
+{"name": "declare_complete", "arguments": {"summary": "Created a wooden chair with material"}}
+</tool_call>
+
+Rules:
+- You may output multiple <tool_call> blocks in a single response.
+- Always use valid JSON inside the tags.
+- Available tool names: generate_mesh, execute_code, inspect_scene,
+  inspect_object, get_object_bounds, inspect_timeline, inspect_animation,
+  capture_viewport, declare_complete.
+- After each response the system will execute the tools and show you the
+  results. Continue calling tools until done, then call declare_complete.
+"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1835,22 +2840,11 @@ def _search_image_urls(query, max_results=3, api_key=None):
     we use OpenAI to suggest reference image search URLs and then
     try to find actual image URLs from those results.
     """
-    # Try direct image search via DuckDuckGo (no API key needed)
-    try:
-        search_url = "https://duckduckgo.com/?q=%s&iax=images&ia=images" % (
-            urllib.request.quote(query + " 3d model reference"))
-        # DuckDuckGo uses a vqd token system, so we use their API endpoint
-        lite_url = "https://lite.duckduckgo.com/lite/?q=%s" % (
-            urllib.request.quote(query + " 3d model reference sheet"))
-        # Fallback: generate search URLs the AI can use
-    except Exception:
-        pass
-
     # Use direct image URLs from known free sources
     urls = []
     try:
         # Try Unsplash source (free, no API key)
-        encoded_q = urllib.request.quote(query)
+        encoded_q = urllib.parse.quote(query)
         for i in range(max_results):
             urls.append("https://source.unsplash.com/800x600/?%s&sig=%d" % (encoded_q, i))
     except Exception:
@@ -1874,7 +2868,7 @@ def _download_image(url, local_path, timeout=10):
 def get_reference_image_paths():
     """Get all pending reference image paths from the current scene."""
     try:
-        import bpy as _bpy
+        import bpy as _bpy  # type: ignore
         props = _bpy.context.scene.ai_copilot
         paths = []
         for ref in props.reference_images:
@@ -1889,7 +2883,7 @@ def _get_reference_images_base64():
     """Encode all enabled reference images as base64 data URLs."""
     paths = _run_on_main_thread(get_reference_image_paths)
     results = []
-    for path in paths:
+    for path in (paths or []):
         try:
             data_url = _image_to_base64(path)
             results.append(data_url)
@@ -1976,7 +2970,7 @@ def generate_response(api_key, model, temperature, user_prompt,
         if viewport_image or ref_images:
             # Replace last user message with multimodal content
             last_msg = messages[-1]
-            content_parts = [{"type": "text", "text": last_msg["content"]}]
+            content_parts: list[dict] = [{"type": "text", "text": last_msg["content"]}]
             if viewport_image:
                 content_parts.append({
                     "type": "image_url",
@@ -1987,7 +2981,7 @@ def generate_response(api_key, model, temperature, user_prompt,
                     "type": "image_url",
                     "image_url": {"url": ref_b64, "detail": "high"},
                 })
-            messages[-1] = {"role": "user", "content": content_parts}
+            messages[-1] = {"role": "user", "content": content_parts}  # type: ignore[assignment]
 
     response_text = _chat(api_key, model, messages, temperature, on_chunk=on_chunk)
     explanation, code = _extract_code(response_text)
@@ -2211,7 +3205,7 @@ def assess_result(api_key, model, temperature, original_request,
     supports_vision = not model_lower.startswith(("o1", "o3"))
     if supports_vision:
         last_msg = messages[-1]
-        content_parts = [{"type": "text", "text": last_msg["content"]}]
+        content_parts: list[dict] = [{"type": "text", "text": last_msg["content"]}]
         if viewport_image:
             content_parts.append({
                 "type": "image_url",
@@ -2225,7 +3219,7 @@ def assess_result(api_key, model, temperature, original_request,
                 "image_url": {"url": ref_b64, "detail": "high"},
             })
         if len(content_parts) > 1:
-            messages[-1] = {"role": "user", "content": content_parts}
+            messages[-1] = {"role": "user", "content": content_parts}  # type: ignore[assignment]
 
     response_text = _chat(api_key, model, messages, temperature, on_chunk=on_chunk)
     _add_iteration_message("assistant", response_text, session_gen=session_gen)

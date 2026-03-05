@@ -1,0 +1,39 @@
+# Prompt-faithfulness retrain with improved prompt hashing and a more balanced
+# curated prompt-goal set to avoid collapsing to NOOP.
+
+model:
+  state_dim: 28
+  hidden_size: 256
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.1
+  action_type_vocab: 12 # 11 previous actions + NOOP
+  action_param_vocab: 32
+  max_seq_len: 64
+
+training:
+  checkpoint_dir: checkpoints/policy_core_prompts_v2hash_balanced
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  grad_clip: 1.0
+  mixed_precision: fp16
+  log_every: 20
+  save_every: 500
+
+data:
+  seed: 0
+  seq_len: 64
+  batch_size: 32
+
+  # Force the model to rely on prompt fingerprinting, not numeric scalars.
+  mask_numeric_goal_prob: 1.00
+
+  goal_source:
+    type: geometry_jsonl
+    path: data/datasets/prompt_goals_core_balanced.jsonl
+    max_records: 100000
+    min_vertices: 4
+    max_vertices: 20000
+
+  trajectory_mode: forward
+  reverse_prob: 0.2

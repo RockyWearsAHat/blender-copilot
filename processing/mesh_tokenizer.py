@@ -36,35 +36,65 @@ class MeshTokenizer:
     BOS = 1
     EOS = 2
     SEP = 3
+    V_SECTION = 4
+    F_SECTION = 5
 
     def __init__(self, vocab_size: int = 8192,
                  coord_range: tuple[float, float] = (-1.0, 1.0),
-                 max_faces: int = 2048):
+                 max_faces: int = 2048,
+                 use_vertex_indexed: bool = False,
+                 max_vertices: int = 4096):
         self.vocab_size = vocab_size
-        self.coord_bins = vocab_size - self.SPECIAL_TOKENS
+        self.use_vertex_indexed = use_vertex_indexed
+        self.max_vertices = max_vertices
+
+        self._special_count = 6 if use_vertex_indexed else self.SPECIAL_TOKENS
+        if use_vertex_indexed:
+            self.index_bins = max_vertices
+            self.coord_bins = vocab_size - self._special_count - self.index_bins
+            if self.coord_bins <= 16:
+                raise ValueError("vocab_size too small for vertex-indexed format")
+            self.index_offset = self._special_count + self.coord_bins
+        else:
+            self.index_bins = 0
+            self.coord_bins = vocab_size - self._special_count
+            self.index_offset = -1
         self.coord_min = coord_range[0]
         self.coord_max = coord_range[1]
         self.coord_range = coord_range[1] - coord_range[0]
         self.max_faces = max_faces
-        self.tokens_per_face = 9  # 3 verts × 3 coords (triangulated)
+        self.tokens_per_face = 3 if use_vertex_indexed else 9
 
     def quantize_coord(self, value: float) -> int:
         """Map a float coordinate to an integer token."""
+        # Guard against NaN/Inf — map to center
+        if not math.isfinite(value):
+            value = 0.0
         # Clamp to range
         value = max(self.coord_min, min(self.coord_max, value))
         # Normalize to [0, 1]
         t = (value - self.coord_min) / self.coord_range
         # Map to bin index
         bin_idx = int(t * (self.coord_bins - 1))
-        return bin_idx + self.SPECIAL_TOKENS
+        return bin_idx + self._special_count
 
     def dequantize_token(self, token: int) -> float:
         """Map an integer token back to a float coordinate."""
-        if token < self.SPECIAL_TOKENS:
+        if token < self._special_count:
             return 0.0
-        bin_idx = token - self.SPECIAL_TOKENS
+        bin_idx = token - self._special_count
         t = bin_idx / (self.coord_bins - 1)
         return self.coord_min + t * self.coord_range
+
+    def encode_index(self, idx: int) -> int:
+        idx = max(0, min(self.max_vertices - 1, int(idx)))
+        return self.index_offset + idx
+
+    def decode_index(self, token: int) -> int:
+        if token < self.index_offset:
+            return 0
+        idx = token - self.index_offset
+        return max(0, min(self.max_vertices - 1, idx))
 
     def encode_mesh(self, vertices: list[list[float]],
                     faces: list[list[int]],
@@ -80,7 +110,19 @@ class MeshTokenizer:
             List of integer tokens
         """
         verts = np.array(vertices)
+
+        # Reject meshes with NaN or Inf vertices
+        if not np.all(np.isfinite(verts)):
+            # Filter out bad vertices, but if too many are bad, fail
+            bad_mask = ~np.all(np.isfinite(verts), axis=1)
+            if bad_mask.sum() > len(verts) * 0.1:
+                return [self.BOS, self.EOS] if add_special else []
+            verts[bad_mask] = 0.0
+
         ordered_faces = self._order_faces(verts, faces)
+
+        if self.use_vertex_indexed:
+            return self._encode_mesh_vertex_indexed(verts, ordered_faces, add_special=add_special)
 
         tokens = []
         if add_special:
@@ -101,6 +143,53 @@ class MeshTokenizer:
 
         return tokens
 
+    def _encode_mesh_vertex_indexed(self, verts: np.ndarray,
+                                    ordered_faces: list[list[int]],
+                                    add_special: bool = True) -> list[int]:
+        """Encode mesh as vertex section + face index section."""
+        tokens = []
+        if add_special:
+            tokens.append(self.BOS)
+        tokens.append(self.V_SECTION)
+
+        remap: dict[int, int] = {}
+        unique_verts: list[np.ndarray] = []
+        safe_faces: list[list[int]] = []
+
+        for face in ordered_faces[:self.max_faces]:
+            if len(face) < 3:
+                continue
+            tri = face[:3]
+            mapped = []
+            valid = True
+            for vi in tri:
+                if vi < 0 or vi >= len(verts):
+                    valid = False
+                    break
+                if vi not in remap:
+                    if len(unique_verts) >= self.max_vertices:
+                        valid = False
+                        break
+                    remap[vi] = len(unique_verts)
+                    unique_verts.append(verts[vi])
+                mapped.append(remap[vi])
+            if valid:
+                safe_faces.append(mapped)
+
+        for v in unique_verts:
+            tokens.append(self.quantize_coord(float(v[0])))
+            tokens.append(self.quantize_coord(float(v[1])))
+            tokens.append(self.quantize_coord(float(v[2])))
+
+        tokens.append(self.F_SECTION)
+        for face in safe_faces:
+            for idx in face:
+                tokens.append(self.encode_index(idx))
+
+        if add_special:
+            tokens.append(self.EOS)
+        return tokens
+
     def decode_tokens(self, tokens: list[int]) -> tuple[list[list[float]], list[list[int]]]:
         """Convert a token sequence back to vertices and faces.
 
@@ -108,8 +197,11 @@ class MeshTokenizer:
             (vertices, faces) where vertices may contain duplicates
             (one set of 3 coords per face vertex).
         """
+        if self.use_vertex_indexed and self.V_SECTION in tokens and self.F_SECTION in tokens:
+            return self._decode_vertex_indexed(tokens)
+
         # Strip special tokens
-        clean = [t for t in tokens if t >= self.SPECIAL_TOKENS]
+        clean = [t for t in tokens if t >= self._special_count]
 
         vertices = []
         faces = []
@@ -126,6 +218,36 @@ class MeshTokenizer:
             vertices.extend(face_verts)
             faces.append(face_indices)
 
+        return vertices, faces
+
+    def _decode_vertex_indexed(self, tokens: list[int]) -> tuple[list[list[float]], list[list[int]]]:
+        """Decode [V_SECTION coords] + [F_SECTION indices] format."""
+        try:
+            v_idx = tokens.index(self.V_SECTION)
+            f_idx = tokens.index(self.F_SECTION)
+        except ValueError:
+            return [], []
+
+        coord_tokens = [t for t in tokens[v_idx + 1:f_idx] if t >= self._special_count and t < self.index_offset]
+        face_tokens = [t for t in tokens[f_idx + 1:] if t >= self.index_offset]
+
+        vertices: list[list[float]] = []
+        for i in range(0, len(coord_tokens) - 2, 3):
+            vertices.append([
+                self.dequantize_token(coord_tokens[i]),
+                self.dequantize_token(coord_tokens[i + 1]),
+                self.dequantize_token(coord_tokens[i + 2]),
+            ])
+
+        faces: list[list[int]] = []
+        for i in range(0, len(face_tokens) - 2, 3):
+            tri = [
+                self.decode_index(face_tokens[i]),
+                self.decode_index(face_tokens[i + 1]),
+                self.decode_index(face_tokens[i + 2]),
+            ]
+            if max(tri, default=0) < len(vertices) and len(set(tri)) == 3:
+                faces.append(tri)
         return vertices, faces
 
     def _order_faces(self, verts: np.ndarray,
@@ -188,6 +310,10 @@ class MeshTokenizer:
 
     def sequence_length_for_faces(self, num_faces: int) -> int:
         """Calculate token sequence length for a given number of faces."""
+        if self.use_vertex_indexed:
+            # Approximation with average valence ~6: V≈F/2 plus section markers.
+            approx_vertices = max(3, int(num_faces * 0.5))
+            return 4 + approx_vertices * 3 + num_faces * 3
         return 2 + num_faces * self.tokens_per_face  # +2 for BOS/EOS
 
     @property
@@ -201,6 +327,8 @@ class MeshTokenizer:
             "vocab_size": self.vocab_size,
             "coord_range": [self.coord_min, self.coord_max],
             "max_faces": self.max_faces,
+            "use_vertex_indexed": self.use_vertex_indexed,
+            "max_vertices": self.max_vertices,
         }
         with open(path, "w") as f:
             json.dump(config, f, indent=2)
@@ -215,6 +343,8 @@ class MeshTokenizer:
             vocab_size=config["vocab_size"],
             coord_range=tuple(config["coord_range"]),
             max_faces=config["max_faces"],
+            use_vertex_indexed=config.get("use_vertex_indexed", False),
+            max_vertices=config.get("max_vertices", 4096),
         )
 
 

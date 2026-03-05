@@ -1,0 +1,43 @@
+# Architecture-compliant policy training (Phase 1: imitation) for Apple Silicon
+# Trains a compact PolicyTransformer over compact mesh-stat state and a finite action grammar.
+
+data:
+  seed: 0
+  seq_len: 64
+  batch_size: 32
+
+  # Optional: sample goal targets from real scraped data.
+  # This does NOT feed raw text into the model; it only uses numeric targets.
+  #
+  # goal_source:
+  #   type: geometry_jsonl
+  #   path: data/datasets/geometry/train.jsonl
+  #   max_records: 50000
+  #
+  # Alternative:
+  # goal_source:
+  #   type: mesh_cache
+  #   path: data/processed/.mesh_cache
+  #   max_files: 20000
+  #   min_quality_weight: 0.5
+
+model:
+  # state_dim = 10 (mesh stats) + 18 (GOAL_DIM: 2 scalars + 16 text-hash feats)
+  state_dim: 28
+  hidden_size: 256
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.1
+  action_type_vocab: 12
+  action_param_vocab: 32
+  max_seq_len: 128
+
+training:
+  checkpoint_dir: checkpoints/policy_goal
+  max_steps: 2000
+  log_every: 20
+  save_every: 200
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  mixed_precision: fp16

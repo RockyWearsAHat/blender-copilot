@@ -1,0 +1,59 @@
+# Fresh training config — replaces the old policy_goal checkpoint from scratch.
+#
+# Key changes from previous runs:
+#   - seq_len=16 matches the real rollout horizon (8–32 steps)
+#   - env.reset() now samples diverse start states (70 % grow / 30 % fine-tune)
+#   - Teacher SUBDIVIDE param is goal-aware: targets 90 % of goal in one step
+#   - SUBDIVIDE env mult capped at 3.0x (was 2–4x) — no more exponential overshoot
+#   - Result: SUBDIVIDE/EXTRUDE ≈ 28 % of training data  (was < 5 %)
+#             DELETE_FACE      ≈  5 % of training data  (was 62 %)
+#
+# Expected wall-clock on Apple M3: ~2–3 h for 50 000 steps at ~5 steps/s.
+
+data:
+  seed: 42
+  seq_len: 16 # matches 8–32 step inference horizon
+  batch_size: 32
+
+  # Train text conditioning: hide numeric goal scalars from the model input
+  # some of the time, while the teacher/env still use the true goal.
+  mask_numeric_goal_prob: 0.7
+
+  # Hoppe-style (coarse↔fine) analog in the compact env:
+  # - forward episodes start below goal (grow)
+  # - reverse episodes start above goal (shrink)
+  trajectory_mode: mixed
+  reverse_prob: 0.5
+
+  # Real human-made mesh supervision (forward build trajectories derived by
+  # reversing collapse traces).
+  collapse_trace_source:
+    path: data/datasets/collapse_traces
+    max_traces: 20000
+    mix_prob: 0.35
+
+  goal_source:
+    type: geometry_jsonl
+    path: data/datasets/geometry/train.jsonl
+    max_records: 5000
+
+model:
+  # state_dim = 10 (mesh stats) + 18 (GOAL_DIM: 2 scalars + 16 text-hash feats)
+  state_dim: 28
+  hidden_size: 256
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.1
+  action_type_vocab: 11
+  action_param_vocab: 32
+  max_seq_len: 128
+
+training:
+  checkpoint_dir: checkpoints/policy_goal
+  max_steps: 50000
+  log_every: 100
+  save_every: 200
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  mixed_precision: fp32 # fp32 for MPS stability

@@ -1,0 +1,43 @@
+# Broad smoke prompts (intentionally diverse). One per line.
+# Used for checkpoint sanity checks to avoid picking a checkpoint
+# that only works for one object.
+
+a cylinder
+
+a cube
+
+a sphere
+
+a cone
+
+a torus
+
+a low poly chair
+
+a coffee mug
+
+a simple table
+
+a wrench
+
+a hammer
+
+a low poly car
+
+a boat
+
+a house
+
+a tower
+
+a tree
+
+a rock
+
+a grassy hill
+
+a staircase
+
+a brick wall
+
+a bottle

@@ -3,6 +3,33 @@
 Fine-tuned local models for Blender 3D generation — trained on real community
 .blend files, not general-purpose LLMs.
 
+If the repo feels too large, start with the concise system map:
+
+- [docs/PROJECT_CONTROL_PANEL.md](docs/PROJECT_CONTROL_PANEL.md)
+
+## Current Status (auto-updated)
+
+This block is written by `python run.py train` / `python run.py serve` so it’s always obvious what is actively training and what Blender is currently serving.
+
+<!-- AUTO-STATUS:BEGIN -->
+
+Last updated: 2026-02-28 15:41:23
+
+Training (active):
+
+- Run: retrain_v1024_focal_resume32k_20260228_154049_mps
+- Config: config.retrain_v1024_focal.yaml
+- Output dir: checkpoints/retrain_v1024_focal_resume32k_20260228_154049_mps
+- Checkpoint being written: checkpoints/\_active/train_latest.pt
+- Train log: logs/train_latest.log
+- Monitor log: logs/monitor_latest.log
+
+Serving (Blender):
+
+- URL: http://127.0.0.1:8420/health
+- Served checkpoint: checkpoints/\_active/served_checkpoint.pt (→ checkpoints/retrain_v1024_focal/best.pt)
+<!-- AUTO-STATUS:END -->
+
 ## The Problem
 
 General-purpose LLMs (GPT-4, Claude, etc.) cannot do 3D modeling:
@@ -195,6 +222,50 @@ python -m training.train_geometry --dataset data/datasets/geometry --output mode
 python -m inference.server --model models/geometry/checkpoints/best.pt --port 8420
 ```
 
+## Restart Training / Cleanup (Safe)
+
+Training generates large, replaceable artifacts (checkpoints, caches, local W&B logs). For a clean restart, you typically want to clear **training outputs** while keeping **data**.
+
+Safe to clean (regenerates automatically):
+
+- `checkpoints/` (model weights like `latest.pt`, `best.pt`, `step_*.pt`)
+- `data/processed/.mesh_cache*` (training cache `.pt` samples)
+- `wandb/`, `.wandb/`, `runs/` (local experiment logs)
+- `data/eval/results.jsonl` (evaluation history)
+
+Do NOT delete for a normal training restart:
+
+- `data/raw/` (downloaded assets)
+- `data/processed/` JSON extractions (except `.mesh_cache*`)
+- `data/datasets/` (built datasets)
+
+The unified CLI includes a conservative cleaner. It’s **dry-run by default** and **archives to `_trash/` by default**.
+
+```bash
+# Preview what would be cleaned (dry-run)
+python run.py clean --checkpoints --wandb --eval
+
+# Archive training artifacts into _trash/clean_<timestamp>/
+python run.py clean --checkpoints --wandb --eval --apply
+
+# Fresh start: permanently delete checkpoints + cache + logs
+python run.py clean --checkpoints --cache --wandb --eval --apply --rm
+
+# Clean only one run folder (e.g. checkpoints/unified)
+python run.py clean --checkpoints --run unified --apply
+```
+
+For Apple Silicon (M3/MPS) restarts, there’s a stability-first config preset:
+
+```bash
+# Quick M3/MPS geometry-only restart
+python run.py clean --checkpoints --wandb --eval --apply
+python run.py train --config config.m3_mps_quick.yaml --name unified_m3 --resume none
+
+# Optional: fast fail smoke-test (no datasets required)
+python scripts/smoke_train.py --config config.m3_mps_quick.yaml --device auto --steps 3
+```
+
 ## Training Data Sources
 
 | Source             | Type                 | Est. Files | License                     |
@@ -246,6 +317,30 @@ python -m inference.server --model models/geometry/checkpoints/best.pt --port 84
 - Any GPU with 8GB+ VRAM (RTX 3060+, M1/M2 Mac)
 - OR CPU-only mode (slower, ~10-30s per generation)
 - ~2-4GB model files per specialist model
+
+## Modeling-First Workflows (Current)
+
+The repository now includes deterministic, architecture-compliant tooling for
+the modeling-first plan:
+
+- Mountain trace generation (non-destructive displacement-first workflow):
+
+```bash
+python scripts/generate_mountain_traces.py --blender /Applications/Blender.app/Contents/MacOS/Blender --n 64
+```
+
+- Low-poly style suite evaluation (stylized vs retro constraints):
+
+```bash
+python scripts/eval_low_poly_style.py --ckpt checkpoints/policy/latest.pt --blender /Applications/Blender.app/Contents/MacOS/Blender
+```
+
+- Tiny intent→noise bucket predictor training/inference:
+
+```bash
+python scripts/train_noise_intent_predictor.py --out checkpoints/noise_intent/latest.pt
+python scripts/predict_noise_intent.py --prompt "jagged rocky mountain terrain" --ckpt checkpoints/noise_intent/latest.pt
+```
 
 ## Roadmap
 

@@ -124,12 +124,6 @@ CURATED_FILES = [
     # ─── Geometry Nodes Demos ───
     {"url": "https://download.blender.org/demo/geometry-nodes/SDF_mixer_kitbukoros.blend",
      "category": "geometry_nodes", "name": "SDF Boolean Mixer"},
-    {"url": "https://download.blender.org/demo/geometry-nodes/tree_leaves_moss_geo-nodes-demo.blend",
-     "category": "geometry_nodes", "name": "Tree Leaves Moss"},
-    {"url": "https://download.blender.org/demo/geometry-nodes/flower_scattering.blend",
-     "category": "geometry_nodes", "name": "Flower Scattering"},
-    {"url": "https://download.blender.org/demo/geometry-nodes/pebble_scattering.blend",
-     "category": "geometry_nodes", "name": "Pebble Scattering"},
     {"url": "https://download.blender.org/demo/geometry-nodes/blender-geometry-nodes_procedural-buildings.blend",
      "category": "geometry_nodes", "name": "Procedural Buildings"},
     {"url": "https://download.blender.org/demo/geometry-nodes/chocolate.blend",
@@ -142,6 +136,36 @@ CURATED_FILES = [
      "category": "geometry_nodes", "name": "Gizmo Array"},
     {"url": "https://download.blender.org/demo/geometry-nodes/transform_socket-pizza_delivery.blend",
      "category": "geometry_nodes", "name": "Pizza Delivery"},
+
+    # ─── Geometry Nodes: Fields demos (Blender 3.1+, updated for Fields workflow) ───
+    {"url": "https://download.blender.org/demo/geometry-nodes/fields/flower_scattering.blend",
+     "category": "geometry_nodes", "name": "Flower Scattering (Fields)"},
+    {"url": "https://download.blender.org/demo/geometry-nodes/fields/pebble_scattering.blend",
+     "category": "geometry_nodes", "name": "Pebble Scattering (Fields)"},
+    {"url": "https://download.blender.org/demo/geometry-nodes/fields/tree_leaves_moss_geo-nodes-demo.blend",
+     "category": "geometry_nodes", "name": "Tree Leaves Moss (Fields)"},
+    {"url": "https://download.blender.org/demo/geometry-nodes/fields/abstract_monkey_fields.blend",
+     "category": "geometry_nodes", "name": "Abstract Monkey Fields"},
+    {"url": "https://download.blender.org/demo/geometry-nodes/fields/ball-in-grass.blend",
+     "category": "geometry_nodes", "name": "Ball In Grass"},
+    {"url": "https://download.blender.org/demo/geometry-nodes/fields/candy_bounce.blend",
+     "category": "geometry_nodes", "name": "Candy Bounce"},
+    {"url": "https://download.blender.org/demo/geometry-nodes/fields/chocolate_donut.blend",
+     "category": "geometry_nodes", "name": "Chocolate Donut (Fields)"},
+    {"url": "https://download.blender.org/demo/geometry-nodes/fields/cupcakes.blend",
+     "category": "geometry_nodes", "name": "Cupcakes"},
+    {"url": "https://download.blender.org/demo/geometry-nodes/fields/geometric_surface_patterns.blend",
+     "category": "geometry_nodes", "name": "Geometric Surface Patterns"},
+    {"url": "https://download.blender.org/demo/geometry-nodes/fields/halloween_spider.blend",
+     "category": "geometry_nodes", "name": "Halloween Spider"},
+    {"url": "https://download.blender.org/demo/geometry-nodes/fields/pasta_planet.blend",
+     "category": "geometry_nodes", "name": "Pasta Planet"},
+    {"url": "https://download.blender.org/demo/geometry-nodes/fields/ripple_dreams_fields.blend",
+     "category": "geometry_nodes", "name": "Ripple Dreams Fields"},
+    {"url": "https://download.blender.org/demo/geometry-nodes/fields/sine_tadpoles_geometry-nodes_demo.blend",
+     "category": "geometry_nodes", "name": "Sine Tadpoles"},
+    {"url": "https://download.blender.org/demo/geometry-nodes/fields/tarte_generator.blend",
+     "category": "geometry_nodes", "name": "Tarte Generator"},
 
     # ─── Rendering / Shading ───
     {"url": "https://download.blender.org/demo/rendering/repeat_zone_fractal_raymarch.blend",
@@ -352,8 +376,11 @@ def download_blender_official(output_dir: Path, max_size_mb: float = 500,
 
     for i, (url, meta) in enumerate(all_urls.items()):
         filename = url.split("/")[-1]
-        # Use a safe ID derived from URL
-        file_id = re.sub(r'[^\w\-.]', '_', filename)
+        # Use a safe ID derived from URL path (not just filename) to avoid
+        # collisions between e.g. geometry-nodes/flower_scattering.blend and
+        # geometry-nodes/fields/flower_scattering.blend
+        url_path = url.replace("https://download.blender.org/demo/", "")
+        file_id = re.sub(r'[^\w\-.]', '_', url_path)
 
         if file_id in downloaded:
             skipped += 1

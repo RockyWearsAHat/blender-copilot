@@ -87,11 +87,16 @@ def get_repo_blend_files(session: requests.Session, owner: str, repo: str,
         resp = session.get(
             f"{GITHUB_API}/repos/{owner}/{repo}/git/trees/{default_branch}",
             params={"recursive": "1"},
-            timeout=30,
+            timeout=(10, 30),  # (connect, read) — don't hang on huge repos
         )
         if resp.status_code != 200:
             return []
-        tree = resp.json().get("tree", [])
+        data = resp.json()
+        # If tree is truncated (repo too big), skip it
+        if data.get("truncated"):
+            logger.debug(f"Tree truncated for {owner}/{repo}, skipping")
+            return []
+        tree = data.get("tree", [])
         return [
             item for item in tree
             if item.get("path", "").lower().endswith(".blend")
@@ -104,10 +109,49 @@ def get_repo_blend_files(session: requests.Session, owner: str, repo: str,
 def download_blend_from_repo(session: requests.Session, owner: str, repo: str,
                               file_path: str, branch: str,
                               output_path: Path, max_size_mb: float) -> bool:
-    """Download a .blend file from a GitHub repo."""
-    # Use raw.githubusercontent.com for direct download
-    url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file_path}"
-    return download_file(url, output_path, max_size_mb=max_size_mb,
+    """Download a .blend file from a GitHub repo, handling Git LFS.
+
+    Uses the GitHub Contents API which provides the real download_url
+    even for LFS-tracked files (via media.githubusercontent.com).
+    """
+    output_path = Path(output_path)
+    if output_path.exists():
+        return True
+
+    max_bytes = int(max_size_mb * 1024 * 1024)
+
+    # Step 1: Get file metadata from Contents API (JSON mode)
+    api_url = (
+        f"{GITHUB_API}/repos/{owner}/{repo}/contents/{file_path}"
+        f"?ref={branch}"
+    )
+    try:
+        resp = session.get(api_url, timeout=(10, 30))
+        if resp.status_code != 200:
+            logger.debug(f"Contents API {resp.status_code} for {owner}/{repo}/{file_path}")
+            return False
+        meta = resp.json()
+    except Exception as e:
+        logger.debug(f"Contents API failed for {owner}/{repo}/{file_path}: {e}")
+        return False
+
+    # Check reported size
+    file_size = meta.get("size", 0)
+    if file_size > max_bytes:
+        logger.info(f"File too large ({file_size / 1e6:.1f}MB), skip")
+        return False
+    if file_size < 512:
+        logger.debug(f"File too small ({file_size}B), skip")
+        return False
+
+    # Step 2: Use download_url (works for both regular files and LFS)
+    dl_url = meta.get("download_url")
+    if not dl_url:
+        logger.debug(f"No download_url for {owner}/{repo}/{file_path}")
+        return False
+
+    return download_file(dl_url, output_path,
+                         max_size_mb=max_size_mb,
                          rate_limit_seconds=0.5)
 
 

@@ -1,0 +1,123 @@
+# ═══════════════════════════════════════════════════════════════
+# STAGE 2 — MEDIUM POLY (800 faces)
+# Tag: medium_poly
+# Prerequisite: stage 1 (low_poly_400f) checkpoint converged
+# Purpose: double the geometric detail budget — PS2/early-mobile quality.
+#          Recognizable surface topology, basic subdivision loops.
+#          Resume from: checkpoints/unified_semantic_bootstrap/latest.pt
+# Next stage: config.stage3_high_poly_2000f.yaml (2000 faces, ~28h on M3,
+#             or ~2h on A100)
+# ═══════════════════════════════════════════════════════════════
+
+project:
+  name: BlenderModelTraining
+  version: 0.1.0
+  stage: medium_poly_800f
+  quality_tag: medium_poly
+  stage_notes: >
+    Stage 2. Resumes from stage 1 low_poly checkpoint. Doubles face budget
+    to 800 — enough for recognizable edge loops, basic surface detail.
+    Cache must be rebuilt (clear .mesh_cache) before starting this stage.
+    Expect ~11 hours on M3 Pro for 80k steps.
+
+data:
+  geometry_dir: data/datasets/geometry
+  materials_train: data/datasets/geometry/materials_train.jsonl
+  modifiers_train: data/datasets/geometry/modifiers_train.jsonl
+  real_mesh_dirs:
+    - data/processed/objaverse
+    - data/processed/blendswap
+    - data/processed/blender_official
+    - data/processed/smutbase
+    - data/processed/github
+    - data/processed/open3dlab
+    - data/processed/youtube
+  cache_dir: data/processed/.mesh_cache_800f
+  eval_dir: data/eval
+  renders_dir: data/renders
+
+tokenization:
+  vocab_size: 8192
+  coordinate_range: [-1.0, 1.0]
+  max_faces: 800
+  max_vertices: 16384
+  face_ordering: "z_curve"
+  triangulate: true
+
+unified:
+  embed_dim: 384
+
+  text_vocab_size: 8000
+  text_max_length: 192
+  text_num_layers: 2
+  text_num_heads: 6
+  dropout: 0.1
+
+  enable_materials: false
+  enable_modifiers: false
+  enable_contrastive: false
+  enable_image_to_mesh: false
+
+  image_size: 32
+  image_num_views: 1
+
+  geometry:
+    num_layers: 5
+    num_heads: 6
+    mesh_vocab_size: 8192
+    max_seq_length: 7202   # 800*9 + 2
+
+  materials:
+    num_layers: 6
+    num_heads: 8
+    hidden_size: 256
+    max_seq_len: 512
+    vocab_size: 4096
+
+  modifiers:
+    hidden_size: 256
+
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  mixed_precision: "bf16"
+
+  learning_rate: 6e-5         # lower LR — fine-tuning from stage 1 checkpoint
+  weight_decay: 0.01
+  warmup_steps: 500
+  max_steps: 80000
+
+  eval_every: 2000
+  save_every: 2000
+
+  optimizer: "adamw"
+  scheduler: "cosine"
+
+  task_weights:
+    geometry: 3.0
+    real_geometry: 10.0
+    materials: 0.0
+    modifiers: 0.0
+    contrastive: 0.0
+    image_geometry: 0.0
+
+  augmentation:
+    random_rotation: true
+    random_scale: [0.9, 1.1]
+    random_flip: true
+    noise_std: 0.001
+
+inference:
+  server_port: 8420
+  device: "auto"
+  max_generation_time_seconds: 60
+  quantization: null
+
+  postprocess:
+    remove_degenerate_faces: true
+    merge_by_distance: 0.0001
+    recalculate_normals: true
+    smooth_shade: true
+
+rlhf:
+  enabled: false

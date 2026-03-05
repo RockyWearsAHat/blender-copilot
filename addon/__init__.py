@@ -1,32 +1,38 @@
-import importlib  # noqa: E402
-import sys  # noqa: E402
-import os  # noqa: E402
+import sys
+import importlib
 
 # bl_info MUST be at module level for Blender's addon scanner.
 bl_info = {
     "name": "Blender AI Copilot",
     "author": "AI Copilot Team",
-    "version": (4, 0, 0),
+    "version": (4, 0, 1),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > AI Copilot",
     "description": "AI-powered assistant for Blender — create, modify and explore anything from text prompts",
-    "warning": "Requires OpenAI API key or local model server",
+    "warning": "Requires AI server (OpenAI-compatible API)",
     "category": "3D View",
 }
 
-# Add the addon directory to sys.path so submodules can import each other
-addon_dir = os.path.dirname(os.path.realpath(__file__))
-if addon_dir not in sys.path:
-    sys.path.append(addon_dir)
-
-from . import properties  # noqa: E402
-from . import preferences  # noqa: E402
-from . import panels  # noqa: E402
-from . import operators  # noqa: E402
-from . import ai_engine  # noqa: E402
-from . import blender_tools  # noqa: E402
-from . import materials  # noqa: E402
-from . import tool_defs  # noqa: E402
+# Import all modules
+if "bpy" in locals():
+    # Reload all modules if already loaded (for F8 script reload)
+    importlib.reload(properties)
+    importlib.reload(preferences)
+    importlib.reload(panels)
+    importlib.reload(operators)
+    importlib.reload(ai_engine)
+    importlib.reload(blender_tools)
+    importlib.reload(materials)
+    importlib.reload(tool_defs)
+else:
+    from . import properties
+    from . import preferences
+    from . import panels
+    from . import operators
+    from . import ai_engine
+    from . import blender_tools
+    from . import materials
+    from . import tool_defs
 
 # Modules that register Blender classes (order matters)
 _modules = [
@@ -36,20 +42,8 @@ _modules = [
     operators,
 ]
 
-# Modules that don't register classes but still need reloading
-_reload_only = [
-    ai_engine,
-    blender_tools,
-    materials,
-    tool_defs,
-]
-
 
 def register():
-    # Reload ALL modules first to pick up code changes from reinstall.
-    # Order matters: reload base modules before dependent ones.
-    for mod in _reload_only + _modules:
-        importlib.reload(mod)
     for mod in _modules:
         mod.register()
 

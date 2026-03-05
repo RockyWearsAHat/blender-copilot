@@ -1,121 +1,36 @@
-"""Addon preferences — stores API key, model, temperature, and backend."""
+"""Addon preferences — local server configuration.
 
-import json
-import ssl
-import urllib.request
-import urllib.error
+This addon intentionally keeps heavy ML deps (torch) out of Blender's Python.
+Policy rollouts are executed via an external Python (venv) process, and the
+resulting OBJ is imported back into the current scene.
+"""
 
 import bpy  # type: ignore
 from bpy.types import AddonPreferences  # type: ignore
-from bpy.props import (  # type: ignore
-    StringProperty, EnumProperty, FloatProperty,
-)
+from bpy.props import StringProperty, FloatProperty, IntProperty, BoolProperty  # type: ignore
+
+from pathlib import Path
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Model cache
-# ═══════════════════════════════════════════════════════════════════════════
-
-_CHAT_PREFIXES = (
-    "gpt-5", "gpt-4", "gpt-3.5",
-    "o1", "o3", "o4",
-)
-
-_EXCLUDE_SUBSTRINGS = (
-    "audio", "realtime", "tts", "transcribe", "search",
-    "instruct", "vision", "embed", "moderation", "dall",
-    "whisper", "babbage", "davinci", "codex", "image",
-    "computer", "chat-latest", "preview",
-)
-
-_cached_model_items: list = [
-    ("gpt-4o", "GPT-4o", "Default model — click Refresh to load all models"),
-]
-
-
-def fetch_openai_models(api_key: str) -> list:
-    """Call GET /v1/models and return sorted list of chat-capable models."""
-    api_key = api_key.strip()
-    url = "https://api.openai.com/v1/models"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    ctx = ssl.create_default_context()
-    try:
-        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
-            body = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8") if e.fp else ""
-        raise RuntimeError(f"OpenAI API error {e.code}: {error_body}") from e
-
-    data = json.loads(body)
-    models = data.get("data", [])
-
-    result = []
-    for m in models:
-        mid = m.get("id", "")
-        if not any(mid.startswith(p) for p in _CHAT_PREFIXES):
-            continue
-        if any(ex in mid for ex in _EXCLUDE_SUBSTRINGS):
-            continue
-        result.append((mid, mid, mid))
-
-    result.sort(key=lambda x: x[0], reverse=True)
-
-    if not result:
-        result.append(("gpt-4o", "GPT-4o", "No chat models found — using default"))
-
-    return result
-
-
-def _get_model_items(self, context):
-    return _cached_model_items
-
-
-def _on_api_key_changed(self, _context):
-    raw = self.openai_api_key
-    cleaned = raw.replace('\n', '').replace('\r', '').replace(' ', '').replace('\t', '')
-    if cleaned != raw:
-        self['openai_api_key'] = cleaned
-    if cleaned:
-        try:
-            items = fetch_openai_models(cleaned)
-            _cached_model_items.clear()
-            _cached_model_items.extend(items)
-        except Exception:
-            pass
+# Hardcoded LLM server URL (ollama)
+LLM_URL = "http://127.0.0.1:11434"
 
 
 class BlenderCopilotPreferences(AddonPreferences):
     bl_idname = __package__
 
-    ai_backend: EnumProperty(  # type: ignore
-        name="AI Backend",
-        description="Which AI backend to use for generation",
-        items=[
-            ("openai", "OpenAI API", "Use OpenAI cloud API (requires API key)"),
-            ("local", "Local Model", "Use locally trained model server (http://127.0.0.1:8420)"),
-        ],
-        default="openai",
+    # ── LLM Brain (ollama / local reasoning model) ──────────────
+    llm_model: StringProperty(  # type: ignore
+        name="LLM Model",
+        description="Model name for the reasoning LLM (e.g. qwen2.5vl:32b)",
+        default="qwen2.5vl:32b",
     )
 
+    # ── Mesh Generation Server (our trained model) ──────────────
     local_server_url: StringProperty(  # type: ignore
-        name="Local Server URL",
-        description="URL of the local inference server",
+        name="Mesh Server URL",
+        description="URL of the trained mesh generation server (for RLHF feedback)",
         default="http://127.0.0.1:8420",
-    )
-
-    openai_api_key: StringProperty(  # type: ignore
-        name="OpenAI API Key",
-        description="Your OpenAI API key (starts with sk-…)",
-        subtype='PASSWORD',
-        default="",
-        update=_on_api_key_changed,
-    )
-
-    model: EnumProperty(  # type: ignore
-        name="Model",
-        description="OpenAI model to use (click Refresh to load from API)",
-        items=_get_model_items,
     )
 
     temperature: FloatProperty(  # type: ignore
@@ -126,49 +41,94 @@ class BlenderCopilotPreferences(AddonPreferences):
         max=1.0,
     )
 
+    generation_timeout: IntProperty(  # type: ignore
+        name="Generation Timeout (seconds)",
+        description="Maximum time to wait for mesh generation (0 = no timeout)",
+        default=0,
+        min=0,
+        max=3600,
+    )
+
+    # ── Policy (architecture-compliant) rollout runner ────────────
+    policy_project_root: StringProperty(  # type: ignore
+        name="Policy Project Root",
+        description="Path to the blender-copilot repo (contains scripts/, checkpoints/, .venv/)",
+        subtype='DIR_PATH',
+        default=str(Path.home() / "blenderPlugins" / "blender-copilot"),
+    )
+
+    policy_python: StringProperty(  # type: ignore
+        name="Policy Python (venv)",
+        description="Path to Python executable with torch installed (outside Blender)",
+        subtype='FILE_PATH',
+        default="",
+    )
+
+    policy_checkpoint: StringProperty(  # type: ignore
+        name="Policy Checkpoint",
+        description="Path to policy checkpoint (.pt), e.g. checkpoints/policy_goal/latest.pt",
+        subtype='FILE_PATH',
+        default="",
+    )
+
+    policy_steps: IntProperty(  # type: ignore
+        name="Policy Steps",
+        description="Number of closed-loop steps for policy generation",
+        default=32,
+        min=1,
+        max=512,
+    )
+
+    policy_seed: IntProperty(  # type: ignore
+        name="Policy Seed",
+        description="Seed for deterministic rollouts",
+        default=0,
+        min=0,
+        max=2**31 - 1,
+    )
+
+    policy_apply_modifiers: BoolProperty(  # type: ignore
+        name="Apply Modifiers",
+        description="Apply generated modifiers (mirror/solidify/etc.) during rollout",
+        default=True,
+    )
+
     def draw(self, context):
         layout = self.layout
         layout.label(text="Blender Copilot Settings", icon='LIGHT')
         layout.separator()
 
-        # Backend selection
+        # LLM Brain section
         box = layout.box()
-        box.label(text="AI Backend", icon='SETTINGS')
-        box.prop(self, "ai_backend", expand=True)
+        box.label(text="AI Brain (Local LLM)", icon='LIGHT')
+        box.prop(self, "llm_model")
+        box.separator()
+        box.label(text="Runs via ollama on %s" % LLM_URL, icon='INFO')
 
-        if self.ai_backend == "local":
-            # Local model settings
-            box2 = layout.box()
-            box2.label(text="Local Model Server", icon='NETWORK_DRIVE')
-            box2.prop(self, "local_server_url")
-            box2.operator("aihouse.test_local_server", text="Test Connection", icon='PLUGIN')
-            box2.separator()
-            box2.label(text="Start server: python cli.py \u2192 option 5", icon='INFO')
-        else:
-            # OpenAI settings
-            box2 = layout.box()
-            box2.label(text="OpenAI API Key", icon='KEYTYPE_KEYFRAME_VEC')
+        layout.separator()
 
-            row = box2.row(align=True)
-            row.scale_y = 1.3
-            row.operator("aihouse.paste_api_key", text="Paste Key from Clipboard", icon='PASTEDOWN')
-            row.operator("aihouse.open_openai_keys", text="", icon='URL')
+        # Mesh server section
+        box2 = layout.box()
+        box2.label(text="Mesh Generation Server", icon='MESH_DATA')
+        box2.prop(self, "local_server_url")
+        box2.label(text="Trained model for direct mesh generation", icon='INFO')
 
-            box2.prop(self, "openai_api_key")
-
-            if self.openai_api_key:
-                key = self.openai_api_key.strip()
-                box2.label(text=f"\u2713 Key set ({len(key)} chars, starts with {key[:8]}\u2026)", icon='CHECKMARK')
-                box2.operator("aihouse.test_api_key", text="Test Connection", icon='PLUGIN')
-            else:
-                box2.label(text="Copy your key then click 'Paste Key from Clipboard'", icon='INFO')
-
-            layout.separator()
-            row = layout.row(align=True)
-            row.prop(self, "model")
-            row.operator("aihouse.refresh_models", text="", icon='FILE_REFRESH')
-
+        layout.separator()
         layout.prop(self, "temperature")
+        layout.prop(self, "generation_timeout")
+
+        layout.separator()
+
+        box3 = layout.box()
+        box3.label(text="Policy Generator (External Python)", icon='OUTLINER_OB_MESH')
+        box3.prop(self, "policy_project_root")
+        box3.prop(self, "policy_python")
+        box3.prop(self, "policy_checkpoint")
+        row = box3.row(align=True)
+        row.prop(self, "policy_steps")
+        row.prop(self, "policy_seed")
+        box3.prop(self, "policy_apply_modifiers")
+        box3.label(text="Runs headless rollout and imports OBJ into this scene", icon='INFO')
 
 
 classes = (

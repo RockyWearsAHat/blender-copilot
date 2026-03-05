@@ -1,0 +1,12 @@
+{
+  "config": "config.retrain_v1024_focal.yaml",
+  "monitor_log": "logs/monitor_latest.log",
+  "monitor_pid": 74499,
+  "output_dir": "checkpoints/retrain_v1024_focal_resume32k_20260228_154049_mps",
+  "pid": 73503,
+  "resume": "checkpoints/retrain_v1024_focal/best.pt",
+  "run_name": "retrain_v1024_focal_resume32k_20260228_154049_mps",
+  "timestamp": "2026-02-28T15:40:49",
+  "train_log": "logs/train_runpy_20260228_154049.log",
+  "train_log_latest": "logs/train_latest.log"
+}

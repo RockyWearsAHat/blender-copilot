@@ -48,9 +48,13 @@ runs/
 *.tar.gz
 nohup.out
 
-# Addon secrets (never commit)
+# Secrets (never commit)
+.env
+.env.*
 addon/apikey.txt
 
 # Misc
 progress_*.json
 test_outputs/
+
+Lambda.pem

@@ -1,0 +1,122 @@
+# ═══════════════════════════════════════════════════════════════
+# STAGE 1 — LOW POLY (400 faces)
+# Tag: low_poly
+# Purpose: base training — grammar, shape prototypes, label grounding.
+#          Output quality: PS1/N64-era silhouettes. Not for production.
+#          Next stage: config.stage2_medium_poly_800f.yaml (800 faces)
+# ═══════════════════════════════════════════════════════════════
+
+project:
+  name: BlenderModelTraining
+  version: 0.1.0
+  stage: low_poly_400f
+  quality_tag: low_poly
+  stage_notes: >
+    Base training run. Teaches the model mesh token grammar and rough
+    shape-class distributions. Intentionally low face count for fast
+    iteration on M3. Checkpoint is the starting point for stage 2.
+
+data:
+  geometry_dir: data/datasets/geometry
+  materials_train: data/datasets/geometry/materials_train.jsonl
+  modifiers_train: data/datasets/geometry/modifiers_train.jsonl
+  real_mesh_dirs:
+    - data/processed/objaverse
+    - data/processed/blendswap
+    - data/processed/blender_official
+    - data/processed/smutbase
+    - data/processed/github
+    - data/processed/open3dlab
+    - data/processed/youtube
+  cache_dir: data/processed/.mesh_cache
+  eval_dir: data/eval
+  renders_dir: data/renders
+
+tokenization:
+  vocab_size: 8192
+  coordinate_range: [-1.0, 1.0]
+  max_faces: 400
+  max_vertices: 8192
+  face_ordering: "z_curve"
+  triangulate: true
+
+unified:
+  embed_dim: 384
+
+  text_vocab_size: 8000
+  text_max_length: 192
+  text_num_layers: 2
+  text_num_heads: 6
+  dropout: 0.1
+
+  enable_materials: false
+  enable_modifiers: false
+  enable_contrastive: false
+  enable_image_to_mesh: false
+
+  image_size: 32
+  image_num_views: 1
+
+  geometry:
+    num_layers: 5
+    num_heads: 6
+    mesh_vocab_size: 8192
+    max_seq_length: 3602
+
+  materials:
+    num_layers: 6
+    num_heads: 8
+    hidden_size: 256
+    max_seq_len: 512
+    vocab_size: 4096
+
+  modifiers:
+    hidden_size: 256
+
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  mixed_precision: "fp32"
+
+  learning_rate: 6.0e-5
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_steps: 80000
+
+  naninf_guard_threshold: 32
+  naninf_guard_mode: "advance"
+
+  eval_every: 2000
+  save_every: 1000
+
+  optimizer: "adamw"
+  scheduler: "cosine"
+
+  task_weights:
+    geometry: 3.0
+    real_geometry: 10.0
+    materials: 0.0
+    modifiers: 0.0
+    contrastive: 0.0
+    image_geometry: 0.0
+
+  augmentation:
+    random_rotation: true
+    random_scale: [0.9, 1.1]
+    random_flip: true
+    noise_std: 0.001
+
+inference:
+  server_port: 8420
+  device: "auto"
+  max_generation_time_seconds: 30
+  quantization: null
+
+  postprocess:
+    remove_degenerate_faces: true
+    merge_by_distance: 0.0001
+    recalculate_normals: true
+    smooth_shade: true
+
+rlhf:
+  enabled: false
