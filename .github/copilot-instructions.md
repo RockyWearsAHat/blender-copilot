@@ -13,7 +13,7 @@ And MUST follow model ownership + blame routing defined in:
 
 docs/model_action_ownership.md
 
-If any generated code or proposal conflicts with #file:.github/ARCHITECTURE.md ,
+If any generated code or proposal conflicts with #file:./ARCHITECTURE.md ,
 ARCHITECTURE.md overrides.
 
 Copilot must reference ARCHITECTURE.md when:
