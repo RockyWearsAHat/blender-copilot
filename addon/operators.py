@@ -3399,9 +3399,76 @@ class AIHOUSE_OT_validator_reconstruct_scene(Operator):
                 _validator_clear_previous()
                 col = _validator_ensure_collection("AI_VALIDATION")
 
+                # Preferred exact path: append source scene datablock and switch to it.
+                # This preserves scene/world/view-layer visibility semantics more
+                # faithfully than reconstructing by linking collections.
+                appended_scenes = []
+                try:
+                    with bpy.data.libraries.load(str(source_blend_path), link=False) as (data_from, data_to):
+                        data_to.scenes = list(data_from.scenes)
+                    appended_scenes = [s for s in (data_to.scenes or []) if s is not None]
+                except Exception:
+                    appended_scenes = []
+
+                if appended_scenes:
+                    target_scene = appended_scenes[0]
+                    try:
+                        source_scene_exact_json = Path(str(result.get("source_scene_exact_json", "")).strip())
+                        if source_scene_exact_json.exists():
+                            source_payload_for_scene = _json.loads(source_scene_exact_json.read_text(encoding="utf-8"))
+                            source_scene_name = str(source_payload_for_scene.get("scene_name", "")).strip() if isinstance(source_payload_for_scene, dict) else ""
+                            if source_scene_name:
+                                for cand_scene in appended_scenes:
+                                    if str(getattr(cand_scene, "name", "")) == source_scene_name:
+                                        target_scene = cand_scene
+                                        break
+                    except Exception:
+                        pass
+
+                    try:
+                        if context.window is not None:
+                            context.window.scene = target_scene
+                    except Exception:
+                        pass
+
+                    props.validator_scene_json = str(source_blend_path)
+                    props.validator_status = f"Reconstructed exact source scene: {target_scene.name}"
+                    self.report({"INFO"}, f"Reconstructed exact scene from: {source_blend_path.name}")
+                    return {"FINISHED"}
+
                 with bpy.data.libraries.load(str(source_blend_path), link=False) as (data_from, data_to):
                     data_to.collections = list(data_from.collections)
                     data_to.worlds = list(data_from.worlds)
+
+                appended_worlds = [w for w in (data_to.worlds or []) if w is not None]
+                appended_collections = [c for c in (data_to.collections or []) if c is not None]
+
+                # Build deterministic lookup scopes from newly appended datablocks
+                # (avoid accidental matches against pre-existing scene/world objects).
+                appended_collection_by_name = {str(c.name): c for c in appended_collections}
+                appended_collection_names = set(appended_collection_by_name.keys())
+                appended_objects = []
+                seen_obj_ptrs = set()
+
+                def _walk_collection_objects(coll):
+                    try:
+                        for obj in getattr(coll, "objects", []):
+                            ptr = int(obj.as_pointer())
+                            if ptr not in seen_obj_ptrs:
+                                seen_obj_ptrs.add(ptr)
+                                appended_objects.append(obj)
+                    except Exception:
+                        pass
+                    try:
+                        for child in getattr(coll, "children", []):
+                            _walk_collection_objects(child)
+                    except Exception:
+                        pass
+
+                for _ac in appended_collections:
+                    _walk_collection_objects(_ac)
+
+                appended_object_by_name = {str(o.name): o for o in appended_objects}
 
                 linked_collections = 0
                 for appended_col in (data_to.collections or []):
@@ -3415,9 +3482,8 @@ class AIHOUSE_OT_validator_reconstruct_scene(Operator):
                         pass
 
                 try:
-                    worlds = [w for w in (data_to.worlds or []) if w is not None]
-                    if worlds:
-                        bpy.context.scene.world = worlds[0]
+                    if appended_worlds:
+                        bpy.context.scene.world = appended_worlds[0]
                 except Exception:
                     pass
 
@@ -3437,6 +3503,167 @@ class AIHOUSE_OT_validator_reconstruct_scene(Operator):
                                 source_scene_payload = scene_data_fallback.get("source_scene", {})
 
                     if isinstance(source_scene_payload, dict):
+                        def _split_name_suffix(name: str) -> tuple[str, str]:
+                            if "." in name:
+                                base, suffix = name.rsplit(".", 1)
+                                if suffix.isdigit():
+                                    return base, suffix
+                            return name, ""
+
+                        def _find_object_name(name: str):
+                            obj = appended_object_by_name.get(name)
+                            if obj is not None:
+                                return obj
+                            obj = bpy.data.objects.get(name)
+                            if obj is not None:
+                                return obj
+                            base, _suffix = _split_name_suffix(name)
+                            for cand in appended_objects:
+                                cand_name = str(getattr(cand, "name", ""))
+                                cand_base, _ = _split_name_suffix(cand_name)
+                                if cand_name == name or cand_base == name or cand_name == base or cand_base == base:
+                                    return cand
+                            for cand in bpy.data.objects:
+                                if cand in appended_objects:
+                                    continue
+                                cand_name = str(getattr(cand, "name", ""))
+                                cand_base, _ = _split_name_suffix(cand_name)
+                                if cand_name == name or cand_base == name or cand_name == base or cand_base == base:
+                                    return cand
+                            return None
+
+                        def _find_collection_name(name: str):
+                            col_target = appended_collection_by_name.get(name)
+                            if col_target is not None:
+                                return col_target
+                            col_target = bpy.data.collections.get(name)
+                            if col_target is not None:
+                                return col_target
+                            base, _suffix = _split_name_suffix(name)
+                            for cand in appended_collections:
+                                cand_name = str(getattr(cand, "name", ""))
+                                cand_base, _ = _split_name_suffix(cand_name)
+                                if cand_name == name or cand_base == name or cand_name == base or cand_base == base:
+                                    return cand
+                            for cand in bpy.data.collections:
+                                if str(getattr(cand, "name", "")) in appended_collection_names:
+                                    continue
+                                cand_name = str(getattr(cand, "name", ""))
+                                cand_base, _ = _split_name_suffix(cand_name)
+                                if cand_name == name or cand_base == name or cand_name == base or cand_base == base:
+                                    return cand
+                            return None
+
+                        def _find_world_name(name: str):
+                            for cand in appended_worlds:
+                                cand_name = str(getattr(cand, "name", ""))
+                                cand_base, _ = _split_name_suffix(cand_name)
+                                if cand_name == name:
+                                    return cand
+                            wrld = bpy.data.worlds.get(name)
+                            if wrld is not None:
+                                return wrld
+                            base, _suffix = _split_name_suffix(name)
+                            for cand in appended_worlds:
+                                cand_name = str(getattr(cand, "name", ""))
+                                cand_base, _ = _split_name_suffix(cand_name)
+                                if cand_name == name or cand_base == name or cand_name == base or cand_base == base:
+                                    return cand
+                            for cand in bpy.data.worlds:
+                                if cand in appended_worlds:
+                                    continue
+                                cand_name = str(getattr(cand, "name", ""))
+                                cand_base, _ = _split_name_suffix(cand_name)
+                                if cand_name == name or cand_base == name or cand_name == base or cand_base == base:
+                                    return cand
+                            return None
+
+                        # Scene-level render/timeline/world/camera settings
+                        try:
+                            scene_target = bpy.context.scene
+                        except Exception:
+                            scene_target = None
+
+                        if scene_target is not None:
+                            try:
+                                render_data = source_scene_payload.get("render", {})
+                                if isinstance(render_data, dict):
+                                    eng = str(render_data.get("engine", "")).strip()
+                                    if eng:
+                                        try:
+                                            scene_target.render.engine = eng
+                                        except Exception:
+                                            pass
+                                    for rk in ("resolution_x", "resolution_y", "resolution_percentage"):
+                                        if rk in render_data:
+                                            try:
+                                                setattr(scene_target.render, rk, int(render_data[rk]))
+                                            except Exception:
+                                                pass
+                                    if "film_transparent" in render_data:
+                                        try:
+                                            scene_target.render.film_transparent = bool(render_data["film_transparent"])
+                                        except Exception:
+                                            pass
+
+                                    cycles_data = render_data.get("cycles")
+                                    if isinstance(cycles_data, dict) and hasattr(scene_target, "cycles"):
+                                        for ck in ("samples", "use_denoising"):
+                                            if ck in cycles_data:
+                                                try:
+                                                    setattr(scene_target.cycles, ck, cycles_data[ck])
+                                                except Exception:
+                                                    pass
+                                        if "device" in cycles_data:
+                                            try:
+                                                scene_target.cycles.device = str(cycles_data["device"])
+                                            except Exception:
+                                                pass
+
+                                    eevee_data = render_data.get("eevee")
+                                    if isinstance(eevee_data, dict) and hasattr(scene_target, "eevee"):
+                                        for ek in ("taa_render_samples", "use_bloom", "use_ssr", "use_gtao"):
+                                            if ek in eevee_data and hasattr(scene_target.eevee, ek):
+                                                try:
+                                                    setattr(scene_target.eevee, ek, eevee_data[ek])
+                                                except Exception:
+                                                    pass
+                            except Exception:
+                                pass
+
+                            try:
+                                if "frame_start" in source_scene_payload:
+                                    scene_target.frame_start = int(source_scene_payload.get("frame_start", scene_target.frame_start))
+                                if "frame_end" in source_scene_payload:
+                                    scene_target.frame_end = int(source_scene_payload.get("frame_end", scene_target.frame_end))
+                                if "frame_current" in source_scene_payload:
+                                    scene_target.frame_current = int(source_scene_payload.get("frame_current", scene_target.frame_current))
+                                if "fps" in source_scene_payload:
+                                    scene_target.render.fps = int(source_scene_payload.get("fps", scene_target.render.fps))
+                            except Exception:
+                                pass
+
+                            try:
+                                active_camera_name = str(source_scene_payload.get("active_camera", "")).strip()
+                                if active_camera_name:
+                                    cam_obj = bpy.data.objects.get(active_camera_name)
+                                    if cam_obj is not None and getattr(cam_obj, "type", "") == "CAMERA":
+                                        scene_target.camera = cam_obj
+                            except Exception:
+                                pass
+
+                            try:
+                                world_data = source_scene_payload.get("world", {})
+                                world_name = str(world_data.get("name", "")).strip() if isinstance(world_data, dict) else ""
+                                if world_name:
+                                    src_world = _find_world_name(world_name)
+                                    if src_world is not None:
+                                        scene_target.world = src_world
+                                elif appended_worlds and scene_target.world is None:
+                                    scene_target.world = appended_worlds[0]
+                            except Exception:
+                                pass
+
                         obj_vis_map = {}
                         for sobj in source_scene_payload.get("objects", []) if isinstance(source_scene_payload.get("objects"), list) else []:
                             if not isinstance(sobj, dict):
@@ -3454,29 +3681,39 @@ class AIHOUSE_OT_validator_reconstruct_scene(Operator):
                             }
 
                         col_vis_map = {}
-                        for scd in source_scene_payload.get("collections", []) if isinstance(source_scene_payload.get("collections"), list) else []:
-                            if not isinstance(scd, dict):
-                                continue
-                            cname = str(scd.get("name", "")).strip()
-                            if not cname:
-                                continue
-                            col_vis_map[cname] = {
-                                "hide_viewport": bool(scd.get("hide_viewport", False)),
-                                "hide_render": bool(scd.get("hide_render", False)),
-                                "hide_select": bool(scd.get("hide_select", False)),
-                            }
+
+                        def _collect_collection_vis(tree_node):
+                            if not isinstance(tree_node, dict):
+                                return
+                            cname = str(tree_node.get("name", "")).strip()
+                            if cname:
+                                col_vis_map[cname] = {
+                                    "hide_viewport": bool(tree_node.get("hide_viewport", False)),
+                                    "hide_render": bool(tree_node.get("hide_render", False)),
+                                    "hide_select": bool(tree_node.get("hide_select", False)),
+                                }
+                            for child in tree_node.get("children", []) if isinstance(tree_node.get("children"), list) else []:
+                                _collect_collection_vis(child)
+
+                        source_collections = source_scene_payload.get("collections", {})
+                        if isinstance(source_collections, dict):
+                            _collect_collection_vis(source_collections)
+                        elif isinstance(source_collections, list):
+                            for entry in source_collections:
+                                _collect_collection_vis(entry)
 
                         # Object-level visibility
                         for obj_name, vis in obj_vis_map.items():
-                            target = bpy.data.objects.get(obj_name)
-                            if target is None and "." in obj_name:
-                                base, suffix = obj_name.rsplit(".", 1)
-                                if suffix.isdigit():
-                                    target = bpy.data.objects.get(base)
+                            target = _find_object_name(obj_name)
                             if target is None:
                                 continue
+                            target_hide_viewport = bool(vis.get("hide_viewport", False))
                             try:
-                                target.hide_viewport = bool(vis.get("hide_viewport", False))
+                                target.hide_viewport = target_hide_viewport
+                            except Exception:
+                                pass
+                            try:
+                                target.hide_set(target_hide_viewport)
                             except Exception:
                                 pass
                             try:
@@ -3488,44 +3725,63 @@ class AIHOUSE_OT_validator_reconstruct_scene(Operator):
                             except Exception:
                                 pass
 
-                        # Collection-level datablock visibility
-                        for col_name, vis in col_vis_map.items():
-                            target_col = bpy.data.collections.get(col_name)
-                            if target_col is None:
-                                continue
-                            try:
-                                target_col.hide_viewport = bool(vis.get("hide_viewport", False))
-                            except Exception:
-                                pass
-                            try:
-                                target_col.hide_render = bool(vis.get("hide_render", False))
-                            except Exception:
-                                pass
-                            try:
-                                target_col.hide_select = bool(vis.get("hide_select", False))
-                            except Exception:
-                                pass
+                        # Collection-level datablock visibility (recursive tree so nested
+                        # collection flags are preserved, not only flat top-level names).
+                        def _apply_collection_tree_vis(tree_node):
+                            if not isinstance(tree_node, dict):
+                                return
+                            cname = str(tree_node.get("name", "")).strip()
+                            if cname:
+                                target_col = _find_collection_name(cname)
+                                if target_col is not None:
+                                    try:
+                                        target_col.hide_viewport = bool(tree_node.get("hide_viewport", False))
+                                    except Exception:
+                                        pass
+                                    try:
+                                        target_col.hide_render = bool(tree_node.get("hide_render", False))
+                                    except Exception:
+                                        pass
+                                    try:
+                                        target_col.hide_select = bool(tree_node.get("hide_select", False))
+                                    except Exception:
+                                        pass
+                            for child in tree_node.get("children", []) if isinstance(tree_node.get("children"), list) else []:
+                                _apply_collection_tree_vis(child)
 
-                        # Layer-collection viewport visibility for active view layer.
+                        try:
+                            _apply_collection_tree_vis(source_scene_payload.get("collections", {}))
+                        except Exception:
+                            pass
+
+                        # Layer-collection viewport visibility across all view layers.
                         def _apply_layer_visibility(layer_coll):
                             if layer_coll is None:
                                 return
                             cname = str(getattr(layer_coll.collection, "name", ""))
+                            if cname not in appended_collection_names:
+                                for child in getattr(layer_coll, "children", []):
+                                    _apply_layer_visibility(child)
+                                return
                             vis = col_vis_map.get(cname)
+                            if vis is None:
+                                base, _suffix = _split_name_suffix(cname)
+                                vis = col_vis_map.get(base)
                             if vis is not None:
                                 try:
                                     layer_coll.hide_viewport = bool(vis.get("hide_viewport", False))
                                 except Exception:
                                     pass
                                 try:
-                                    layer_coll.exclude = False
+                                    layer_coll.exclude = bool(vis.get("hide_viewport", False))
                                 except Exception:
                                     pass
                             for child in getattr(layer_coll, "children", []):
                                 _apply_layer_visibility(child)
 
                         try:
-                            _apply_layer_visibility(bpy.context.view_layer.layer_collection)
+                            for _vl in bpy.context.scene.view_layers:
+                                _apply_layer_visibility(getattr(_vl, "layer_collection", None))
                         except Exception:
                             pass
                 except Exception:
